@@ -45,6 +45,11 @@ pub struct CdpContext {
     pub next_isolated_context_id: i64,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    // CDP Emulation overrides
+    pub emulation_timezone: Option<String>,
+    pub emulation_locale: Option<String>,
+    pub emulation_languages: Option<Vec<String>>,
+    pub emulation_hardware_concurrency: Option<u32>,
 }
 
 impl CdpContext {
@@ -141,6 +146,10 @@ impl CdpContext {
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
+            emulation_timezone: None,
+            emulation_locale: None,
+            emulation_languages: None,
+            emulation_hardware_concurrency: None,
         }
     }
 
@@ -157,6 +166,13 @@ impl CdpContext {
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
         let mut page = Page::new(page_id.clone(), self.default_context.clone());
+        // Pass Emulation overrides to new pages
+        if let Some(ref _tz) = self.emulation_timezone {
+            // TZ is set at process level; init_js handles JS overrides
+        }
+        page.emulation_locale = self.emulation_locale.clone();
+        page.emulation_languages = self.emulation_languages.clone();
+        page.emulation_hardware_concurrency = self.emulation_hardware_concurrency;
         page.navigate_blank();
         self.pages.push(page);
         page_id
@@ -338,10 +354,11 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
+        "Log" | "Performance" | "Security" | "CSS"
         | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
         | "Audits" => {

@@ -179,6 +179,10 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    // CDP Emulation overrides
+    pub emulation_locale: Option<String>,
+    pub emulation_languages: Option<Vec<String>>,
+    pub emulation_hardware_concurrency: Option<u32>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -230,6 +234,9 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            emulation_locale: None,
+            emulation_languages: None,
+            emulation_hardware_concurrency: None,
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -335,6 +342,15 @@ impl Page {
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
+        }
+
+        // Apply CDP Emulation overrides
+        if let Some(lang) = &self.emulation_locale {
+            let langs = self.emulation_languages.clone().unwrap_or_else(|| vec![lang.clone()]);
+            rt.set_locale(lang, &langs);
+        }
+        if let Some(hw) = self.emulation_hardware_concurrency {
+            rt.set_hardware_concurrency(hw);
         }
 
         rt.run_page_init();

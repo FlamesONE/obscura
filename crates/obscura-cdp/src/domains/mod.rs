@@ -10,3 +10,4 @@ pub mod input;
 pub mod storage;
 pub mod accessibility;
 pub mod lp;
+pub mod emulation;

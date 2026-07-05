@@ -244,6 +244,49 @@ impl ObscuraJsRuntime {
         );
     }
 
+    pub fn set_locale(&mut self, language: &str, languages: &[String]) {
+        let lang = language.replace('\'', "\\'");
+        let langs: Vec<String> = languages.iter().map(|l| format!("'{}'", l.replace('\'', "\\'"))).collect();
+        let langs_str = langs.join(",");
+        let _ = self.runtime.execute_script(
+            "<set-locale>",
+            format!(
+                "globalThis.__obscura_language = '{}'; globalThis.__obscura_languages = [{}];",
+                lang, langs_str
+            ),
+        );
+    }
+
+    pub fn set_hardware_concurrency(&mut self, concurrency: u32) {
+        let _ = self.runtime.execute_script(
+            "<set-hw>",
+            format!("globalThis.__obscura_hardware_concurrency = {};", concurrency),
+        );
+    }
+
+    pub fn set_timezone(&mut self, timezone_id: &str) {
+        let tz = timezone_id.replace('\'', "\\'");
+        let _ = self.runtime.execute_script(
+            "<set-tz>",
+            format!("globalThis.__obscura_timezone = '{}';", tz),
+        );
+        // Override Intl.DateTimeFormat to report the custom timezone
+        let _ = self.runtime.execute_script(
+            "<override-intl-tz>",
+            format!(
+                r#"(function(){{
+                    var _origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;
+                    Intl.DateTimeFormat.prototype.resolvedOptions = function() {{
+                        var res = _origResolved.call(this);
+                        res.timeZone = '{}';
+                        return res;
+                    }};
+                }})()"#,
+                tz
+            ),
+        );
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {

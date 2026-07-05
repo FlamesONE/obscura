@@ -15,6 +15,8 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
+    '__obscura_language', '__obscura_languages',
+    '__obscura_timezone', '__obscura_hardware_concurrency',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -2831,8 +2833,15 @@ function _uaBrands() {
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  language: "en-US", languages: ["en-US","en"], get platform() { return globalThis.__obscura_platform || "Win32"; },
-  onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
+  get language() { return globalThis.__obscura_language || "en-US"; },
+  get languages() { return globalThis.__obscura_languages || ["en-US","en"]; },
+  get platform() { return globalThis.__obscura_platform || "Win32"; },
+  onLine: true, cookieEnabled: true,
+  get hardwareConcurrency() {
+    var cdp = globalThis.__obscura_hardware_concurrency;
+    if (cdp != null) return cdp;
+    return 8;
+  },
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
@@ -7372,7 +7381,9 @@ globalThis.__obscura_init = function() {
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+  if (globalThis.__obscura_hardware_concurrency == null) {
+    globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+  }
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
