@@ -8092,8 +8092,48 @@ if (typeof FontFace === 'undefined') {
 }
 
 if (typeof SharedWorker === 'undefined') {
+  // A SharedWorker that actually runs its script and drives the connect/port
+  // protocol. Fingerprinters (CreepJS getSharedWorker) post the same fingerprint
+  // script and await the worker's port message; a dead stub left that Promise
+  // pending forever (the whole FP hash stayed "Computing"). Back it with a real
+  // dedicated Worker execution, then fire the script's `onconnect` with a
+  // MessagePort that routes the worker's postMessage back to the page-side port.
   globalThis.SharedWorker = class SharedWorker {
-    constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
+    constructor(url) {
+      var shared = this; this.onerror = null;
+      var pageListeners = []; var workerPortOnMsg = null;
+      this.port = {
+        onmessage: null, start: function(){}, close: function(){ shared._closed = true; },
+        postMessage: function(m){ if (typeof workerPortOnMsg === 'function') setTimeout(function(){ try{ workerPortOnMsg({ data: m }); }catch(e){} }, 0); },
+        addEventListener: function(t, fn){ if (t === 'message' && typeof fn === 'function') pageListeners.push(fn); },
+        removeEventListener: function(){},
+      };
+      function deliverToPage(data){ var e = { data: data }; if (typeof shared.port.onmessage === 'function'){ try{ shared.port.onmessage(e); }catch(x){} } pageListeners.forEach(function(fn){ try{ fn(e); }catch(x){} }); }
+      var w = new Worker(url);
+      var tries = 0;
+      function fireConnect(){
+        if (shared._closed) return;
+        var scope = w._scope;
+        if (!scope) { if (tries++ < 100) setTimeout(fireConnect, 10); return; }
+        if (shared._connected) return; shared._connected = true;
+        var workerPort = {
+          start: function(){}, close: function(){},
+          postMessage: function(m){ deliverToPage(m); },
+          addEventListener: function(t, fn){ if (t === 'message') workerPortOnMsg = fn; },
+          removeEventListener: function(){},
+        };
+        Object.defineProperty(workerPort, 'onmessage', { get: function(){ return workerPortOnMsg; }, set: function(fn){ workerPortOnMsg = fn; }, configurable: true, enumerable: true });
+        var ev = { ports: [workerPort], source: workerPort, data: '' };
+        try {
+          if (typeof scope.onconnect === 'function') scope.onconnect(ev);
+          var cl = (scope._ev && scope._ev['connect']) || [];
+          cl.forEach(function(fn){ try{ fn(ev); }catch(x){} });
+        } catch(e){}
+      }
+      // Ensure the worker's top-level code has run (blob auto-runs on a tick),
+      // then drive the connect handshake.
+      setTimeout(function(){ if (w._ensureRun) w._ensureRun(); fireConnect(); }, 0);
+    }
   };
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
