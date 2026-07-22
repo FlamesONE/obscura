@@ -533,6 +533,7 @@ impl Page {
         let context_platform = self.context.platform.clone();
         let context_ua_platform = self.context.ua_platform.clone();
         let context_ua_platform_version = self.context.ua_platform_version.clone();
+        let fp_seed = fp_seed_for(&self.context.id);
         let http_client = self.http_client.clone();
         #[cfg(feature = "stealth")]
         let stealth_enabled = self.stealth_client.is_some();
@@ -613,6 +614,9 @@ impl Page {
         if let Some(hw) = emulation_hardware_concurrency {
             rt.set_hardware_concurrency(hw);
         }
+        // Session-stable fingerprint seed (F1): same identity → same seed across
+        // navigations and realms, so canvas/audio/WebGL/screen never drift.
+        rt.set_fp_seed(fp_seed);
         rt.run_page_init();
         frame.js = Some(rt);
     }
@@ -822,6 +826,7 @@ impl Page {
             rt.set_hardware_concurrency(hw);
         }
 
+        rt.set_fp_seed(fp_seed_for(&self.context.id));
         rt.run_page_init();
         self.js = Some(rt);
         self.sync_frame_snapshots_to_root_runtime();
@@ -2268,6 +2273,23 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
         }
+    }
+}
+
+/// Derive a session-stable fingerprint seed from the browser-context identity.
+/// FNV-1a over the context id: same identity → same seed every navigation and in
+/// every realm; different contexts (different identities) get different seeds.
+fn fp_seed_for(context_id: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in context_id.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    // Avoid 0 — the JS side treats 0 as "no seed injected" and falls back to the clock.
+    if h == 0 {
+        0x9e37_79b9
+    } else {
+        h
     }
 }
 

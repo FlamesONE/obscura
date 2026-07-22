@@ -8232,7 +8232,11 @@ globalThis.__obscura_init = function() {
   // like a real browser. Must run before the first op call below (_dom).
   try { if (typeof Deno !== "undefined" && Deno.core) __obscura_core = Deno.core; } catch (e) {}
   try { delete globalThis.Deno; } catch (e) {}
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  // Session-stable seed injected by Rust (set_fp_seed, derived from the browser
+  // context identity) so canvas/audio/WebGL/screen are byte-identical across
+  // navigations and realms — store-and-compare detectors flag drift. Clock
+  // fallback only for bare-JS unit tests where Rust never injects a seed.
+  _fpSeed = (globalThis.__obscura_fp_seed >>> 0) || (Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0));
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive

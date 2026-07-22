@@ -324,6 +324,19 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Pin the fingerprint RNG seed for this realm. Session-stable (derived from
+    /// the browser-context identity, not the clock), so canvas/audio/WebGL/screen
+    /// stay byte-identical across navigations AND across realms (main + workers +
+    /// iframes of the same identity read the same seed). Cross-navigation drift is
+    /// exactly what store-and-compare detectors (CreepJS) flag. Must run before
+    /// __obscura_init, which reads globalThis.__obscura_fp_seed.
+    pub fn set_fp_seed(&mut self, seed: u32) {
+        let _ = self.runtime.execute_script(
+            "<set-fp-seed>",
+            format!("globalThis.__obscura_fp_seed = {};", seed),
+        );
+    }
+
     pub fn set_timezone(&mut self, timezone_id: &str) {
         let tz = timezone_id.replace('\'', "\\'");
         let _ = self.runtime.execute_script(
