@@ -7006,16 +7006,42 @@ globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { construct
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
 globalThis.MediaStreamTrack = class MediaStreamTrack { constructor(){this.kind='';this.enabled=true;this.readyState='live';} stop(){} clone(){return new MediaStreamTrack();} };
 globalThis.RTCPeerConnection = class RTCPeerConnection {
-  constructor(){this.localDescription=null;this.remoteDescription=null;this.iceConnectionState='new';this.iceGatheringState='new';this.signalingState='stable';this.connectionState='new';}
+  constructor(){
+    this.localDescription=null;this.remoteDescription=null;
+    this.iceConnectionState='new';this.iceGatheringState='new';
+    this.signalingState='stable';this.connectionState='new';
+    this.onicecandidate=null;this.onicegatheringstatechange=null;
+    this.oniceconnectionstatechange=null;this.onconnectionstatechange=null;this.onsignalingstatechange=null;
+    this._listeners={};
+  }
+  addEventListener(t,fn){ if(typeof fn==='function'){(this._listeners[t]=this._listeners[t]||[]).push(fn);} }
+  removeEventListener(t,fn){ var l=this._listeners[t]; if(l){var i=l.indexOf(fn); if(i>=0)l.splice(i,1);} }
+  dispatchEvent(){ return true; }
+  _emit(t,ev){ ev=ev||{}; if(ev.type===undefined)ev.type=t; var h=this['on'+t]; if(typeof h==='function'){try{h.call(this,ev);}catch(e){}} (this._listeners[t]||[]).forEach(function(fn){try{fn.call(this,ev);}catch(e){}}, this); }
   createOffer(){return Promise.resolve({type:'offer',sdp:''});}
   createAnswer(){return Promise.resolve({type:'answer',sdp:''});}
-  setLocalDescription(){return Promise.resolve();}
+  setLocalDescription(d){ this.localDescription=d||{type:'offer',sdp:''}; this._gather(); return Promise.resolve(); }
   setRemoteDescription(){return Promise.resolve();}
   addIceCandidate(){return Promise.resolve();}
   close(){}
   createDataChannel(){return {close(){},send(){},addEventListener(){},removeEventListener(){}};}
-  addEventListener(){} removeEventListener(){}
   getStats(){return Promise.resolve(new Map());}
+  // ICE gathering must terminate or WebRTC fingerprinters (CreepJS) that await a
+  // final onicecandidate(null) hang forever. Emit NO host candidates (no real-IP
+  // leak — privacy-safe, like a browser with WebRTC IP handling policy) and then
+  // the null candidate that signals gathering-complete.
+  _gather(){
+    var self=this;
+    if(self.iceGatheringState!=='new')return;
+    setTimeout(function(){
+      self.iceGatheringState='gathering'; self._emit('icegatheringstatechange',{});
+      setTimeout(function(){
+        self.iceGatheringState='complete';
+        self._emit('icecandidate',{candidate:null});
+        self._emit('icegatheringstatechange',{});
+      },0);
+    },0);
+  }
 };
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
