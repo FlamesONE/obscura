@@ -7804,6 +7804,27 @@ if (typeof Image === 'undefined') {
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
 }
 
+if (typeof MediaRecorder === 'undefined') {
+  // Real Chrome exposes MediaRecorder; its absence ('MediaRecorder' in window ===
+  // false) is a fingerprint tell (CreepJS media surface). isTypeSupported must
+  // report Chrome's codec matrix.
+  globalThis.MediaRecorder = class MediaRecorder {
+    constructor(stream, opts) { this.stream = stream; this.state = 'inactive'; this.mimeType = (opts && opts.mimeType) || ''; this.videoBitsPerSecond = 0; this.audioBitsPerSecond = 0; this.ondataavailable = null; this.onstop = null; this.onstart = null; this.onerror = null; }
+    start() { this.state = 'recording'; }
+    stop() { this.state = 'inactive'; }
+    pause() { this.state = 'paused'; }
+    resume() { this.state = 'recording'; }
+    requestData() {}
+    addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+    static isTypeSupported(t) {
+      t = String(t || '');
+      return /^(audio\/webm|video\/webm|audio\/mp4|video\/mp4|video\/x-matroska)(;|$)/.test(t) ||
+        /codecs[:=]?.*(vp8|vp9|opus|avc1|h264|pcm)/i.test(t);
+    }
+  };
+  _markNative(globalThis.MediaRecorder);
+  _markNative(globalThis.MediaRecorder.isTypeSupported);
+}
 if (typeof Audio === 'undefined') {
   globalThis.Audio = class Audio {
     constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
