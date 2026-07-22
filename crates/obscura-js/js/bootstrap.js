@@ -5724,8 +5724,19 @@ globalThis.HTMLImageElement = Element;
     return src ? 16 : 0;
   }
   _markNative(imgDim);
-  Object.defineProperty(Element.prototype, 'naturalWidth', { get: imgDim, enumerable: true, configurable: true });
-  Object.defineProperty(Element.prototype, 'naturalHeight', { get: imgDim, enumerable: true, configurable: true });
+  // A setter is required: the Image() constructor assigns img.naturalWidth (a
+  // loaded image's real dimensions). Without one, that assignment throws
+  // "only a getter" and new Image() dies — which broke the tpCanvas /
+  // TRANSPARENT_PIXEL probe. The setter shadows the getter with an own data prop.
+  function mkDim(key) {
+    Object.defineProperty(Element.prototype, key, {
+      get: imgDim,
+      set: function(v) { Object.defineProperty(this, key, { value: v, writable: true, enumerable: true, configurable: true }); },
+      enumerable: true, configurable: true,
+    });
+  }
+  mkDim('naturalWidth');
+  mkDim('naturalHeight');
 })();
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
