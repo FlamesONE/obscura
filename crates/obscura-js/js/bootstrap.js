@@ -5713,6 +5713,20 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = Element;
+// Broken/undecoded <img> reports the 16x16 broken-image icon in real Chrome
+// (a 0x0 or absent naturalWidth is a classic headless tell — sannysoft/creepjs).
+// obscura doesn't decode raster images, so a <img> with any src reads as broken
+// → 16; no src → 0. A loaded Image() instance sets its own naturalWidth and wins.
+(function() {
+  function imgDim() {
+    if (this.tagName !== 'IMG') return undefined;
+    var src = this.getAttribute && this.getAttribute('src');
+    return src ? 16 : 0;
+  }
+  _markNative(imgDim);
+  Object.defineProperty(Element.prototype, 'naturalWidth', { get: imgDim, enumerable: true, configurable: true });
+  Object.defineProperty(Element.prototype, 'naturalHeight', { get: imgDim, enumerable: true, configurable: true });
+})();
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
