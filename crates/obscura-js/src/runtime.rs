@@ -431,7 +431,7 @@ impl ObscuraJsRuntime {
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                         globalThis.__obscura_await_rejected = true;\n\
                     }}\n\
-                    globalThis.__obscura_done_{done_counter} = true;\n\
+                    globalThis.__obscura_objects['d{done_counter}'] = true;\n\
                 }})()",
                 expr = cleaned_expr,
                 oid = oid,
@@ -460,7 +460,7 @@ impl ObscuraJsRuntime {
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let sentinel = format!("globalThis.__obscura_objects['d{done_counter}'] === true");
             self.resolve_promises_until(
                 |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
                     .ok()
@@ -546,7 +546,7 @@ impl ObscuraJsRuntime {
                         globalThis.__obscura_objects['{oid}'] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                     }} finally {{\n\
-                        globalThis.__obscura_done_{done_counter} = true;\n\
+                        globalThis.__obscura_objects['d{done_counter}'] = true;\n\
                     }}\n\
                 }})()",
                 setup = setup,
@@ -564,7 +564,7 @@ impl ObscuraJsRuntime {
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            let sentinel = format!("globalThis.__obscura_objects['d{done_counter}'] === true");
             self.resolve_promises_until(
                 |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
                     .ok()

@@ -22,6 +22,8 @@ let __obscura_core = (typeof Deno !== "undefined" && Deno.core) ? Deno.core : nu
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_await_meta', '__obscura_await_rejected', '__obscura_fp_seed',
+    '__obscura_geo_lat', '__obscura_geo_lon', '__obscura_set',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
     '__obscura_language', '__obscura_languages',
