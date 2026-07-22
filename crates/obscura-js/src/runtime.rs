@@ -10,7 +10,7 @@ use obscura_dom::DomTree;
 pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
-use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{build_extension, FrameSnapshot, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -106,17 +106,31 @@ impl ObscuraJsRuntime {
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
-        Self::with_base_url_and_proxy(base_url, None)
+        Self::with_options(base_url, None, std::sync::Arc::new(obscura_net::CookieJar::new()), false)
     }
 
     /// Construct a runtime whose ES-module loader routes dynamic imports
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        Self::with_options(base_url, proxy_url, std::sync::Arc::new(obscura_net::CookieJar::new()), false)
+    }
+
+    pub fn with_options(
+        base_url: &str,
+        proxy_url: Option<String>,
+        cookie_jar: std::sync::Arc<obscura_net::CookieJar>,
+        stealth: bool,
+    ) -> Self {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
 
-        let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
+        let module_loader = Rc::new(ObscuraModuleLoader::with_options(
+            base_url,
+            proxy_url,
+            cookie_jar,
+            stealth,
+        ));
 
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![build_extension()],
@@ -183,12 +197,31 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().blocked_urls = patterns;
     }
 
+    pub fn set_frame_snapshot(&self, frame_id: &str, html: &str, url: &str, same_origin: bool) {
+        self.state.borrow_mut().frame_snapshots.insert(
+            frame_id.to_string(),
+            FrameSnapshot {
+                html: html.to_string(),
+                url: url.to_string(),
+                same_origin,
+            },
+        );
+    }
+
+    pub fn clear_frame_snapshots(&self) {
+        self.state.borrow_mut().frame_snapshots.clear();
+    }
+
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
+    }
+
+    pub fn take_pending_iframe_loads(&self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.state.borrow_mut().pending_iframe_loads)
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {

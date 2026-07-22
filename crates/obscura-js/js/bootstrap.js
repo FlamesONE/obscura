@@ -1,5 +1,14 @@
 "use strict";
 
+// Captured reference to the deno_core op bridge. Every internal op call goes
+// through this lexical binding (`__obscura_core.ops.*`) instead of the global
+// `Deno` object, so we can delete `globalThis.Deno` at page-init time without
+// breaking ops. `typeof Deno` then reads `undefined` to page/CF script — the
+// deno bridge was an instant, trivially-scriptable bot tell (probe confirmed
+// `typeof Deno === "object"`). Refreshed at runtime in __obscura_init before
+// the first op call, so the snapshot-time value here is only a fallback.
+let __obscura_core = (typeof Deno !== "undefined" && Deno.core) ? Deno.core : null;
+
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
 // declarations or property assignments below: once a property is defined
@@ -17,6 +26,9 @@
     '__obscura_stealth', '__obscura_markTrusted',
     '__obscura_language', '__obscura_languages',
     '__obscura_timezone', '__obscura_hardware_concurrency',
+    '__obscura_turnstile_hook_installed', '__obscura_turnstile_token',
+    '__capturedSitekey', '__capturedAction', '__capturedCdata',
+    '__capturedChlPageData', '__capturedTurnstileCallback',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -69,7 +81,36 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+globalThis.__obscura_diagFallback = function(name, vmThis) {
+  try {
+    const keys = Object.keys(vmThis || {});
+    const g = vmThis && vmThis.g;
+    const describe = v => v === undefined ? 'UNDEF' : v === globalThis ? 'GLOBALTHIS' : typeof v === 'function' ? 'fn:' + (v.name || '?') : typeof v === 'object' && v !== null ? 'obj:' + (v.constructor && v.constructor.name || '?') : typeof v;
+    const gAll = Array.isArray(g) ? g.map(describe) : typeof g;
+    const undefIdx = Array.isArray(g) ? g.reduce((acc, v, i) => { if (v === undefined) acc.push(i); return acc; }, []) : [];
+    console.error('DIAG receiver-fallback name=', JSON.stringify(name), 'vm-keys=', JSON.stringify(keys),
+      'g-len=', Array.isArray(g) ? g.length : 'n/a', 'undef-indices=', JSON.stringify(undefIdx),
+      'g-full=', JSON.stringify(gAll),
+      'other-vm-fields=', JSON.stringify({h: describe(vmThis.h), j: vmThis.j, i: vmThis.i, l: vmThis.l, m: describe(vmThis.m)}));
+  } catch (e) { try { console.error('DIAG receiver-fallback dump failed:', e.message, e.stack); } catch(e2) {} }
+};
+const _dom = (cmd, a1, a2) => __obscura_core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+const _frameHtml = (fid) => __obscura_core.ops.op_frame_html(String(fid ?? ""));
+const _frameMeta = (fid) => __obscura_core.ops.op_frame_meta(String(fid ?? ""));
+
+// Tell the Rust page loop about an <iframe> inserted at runtime so it loads
+// and executes it with a live child runtime (not the inert _loadIframeSrc
+// shim). Passes the literal src attribute — Rust resolves it and matches the
+// node by `iframe[src=...]`. This is what makes a dynamically-created
+// Cloudflare Turnstile widget iframe actually run its scripts.
+const __registerDynamicIframe = (el) => {
+  try {
+    if (!el || el.tagName !== 'IFRAME') return;
+    const src = el.getAttribute && el.getAttribute('src');
+    if (!src || src === 'about:blank') return;
+    __obscura_core.ops.op_register_dynamic_iframe(el._nid | 0, String(src));
+  } catch (e) {}
+};
 
 const _nativeFns = new Set();
 const _origToString = Function.prototype.toString;
@@ -121,12 +162,50 @@ async function __processDynScriptQueue() {
         if (task.isModule) {
           await import(task.url);
         } else {
-          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+          const raw = await __obscura_core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
           const parsed = JSON.parse(raw);
           if (parsed.body) {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(parsed.body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            try {
+              // __obscura_core.evalContext compiles+runs as a real top-level V8
+              // Script (v8::Script::compile+run), not the JS `eval` builtin.
+              // That distinction matters: per spec, indirect eval gets its
+              // own throwaway lexical environment for top-level let/const/
+              // class on every call, so a helper `let`-bound in one
+              // dynamically-injected <script> was invisible to a later one
+              // even though real browsers share one global lexical
+              // environment across all classic scripts on a page. Vendor
+              // bundles that split into multiple sequentially-injected
+              // <script> chunks assuming that sharing (observed: Cloudflare's
+              // challenge/Turnstile runtime) threw "X is not a function" deep
+              // in minified code under the old (0, eval)() path.
+              (globalThis.__obscura_dynScriptBodies ||= {})[task.url] = parsed.body;
+              // Diagnostic-only (both patches below): substituting
+              // globalThis[name] for the raw string here was tried and
+              // reverted — it stopped the visible "X is not a function"
+              // crash, but the VM then span into a synchronous busy loop
+              // that our own watchdog had to kill (`V8 watchdog fired:
+              // terminated a synchronous overrun`), which is a strictly
+              // worse outcome (silent hang vs. a caught, logged exception)
+              // and made zero progress past "Just a moment" either way.
+              // The receiver register genuinely needs to hold whatever
+              // real Chrome holds there; substituting a plausible-looking
+              // stand-in doesn't get the VM's actual computation right.
+              let patchedBody = parsed.body.replace(
+                /:function\((\w+)\)\{return \1\(\)\}/g,
+                ':function($1){if(typeof $1!=="function"){try{console.error("DIAG generic-invoker got non-function:",typeof $1,String($1));}catch(e3){}}return $1()}'
+              );
+              patchedBody = patchedBody.replace(
+                /(\w+)=(\w+)===void 0\?(\w+):\2\[\3\]/g,
+                '$1=$2===void 0?(globalThis.__obscura_diagFallback($3,this),$3):$2[$3]'
+              );
+              const [, evalError] = __obscura_core.evalContext(patchedBody, task.url);
+              if (evalError) {
+                const thrown = evalError.thrown;
+                const msg = thrown && thrown.message ? thrown.message : String(thrown);
+                console.error('Dynamic script error (' + task.url + '):', msg);
+              }
+            }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
           }
         }
@@ -267,7 +346,7 @@ function _getElementsByClassName(root, classNames) {
   return HTMLCollection._from(matched);
 }
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
+  try { __obscura_core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     if (a instanceof Error) {
@@ -302,8 +381,15 @@ const _intervals = new Set();
 
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
-  if (d === 0) Promise.resolve().then(fn);
-  else Deno.core.ops.op_sleep(d).then(fn);
+  // setTimeout(fn, 0) is a MACROTASK in every real engine: it only runs once
+  // the microtask queue is fully drained, even when scheduled for 0ms. A
+  // Promise.resolve().then(fn) shortcut here runs fn as a microtask instead,
+  // so code that relies on setTimeout(fn, 0) running strictly after
+  // already-queued Promise callbacks (a common scheduler/interpreter
+  // pattern — observed: Cloudflare's challenge VM) sees fn fire too early,
+  // before state a microtask was about to populate exists yet. Routing
+  // through op_sleep even for d===0 forces a real event-loop tick.
+  __obscura_core.ops.op_sleep(d).then(fn);
 };
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
@@ -333,7 +419,10 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
 };
 
 globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
-globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+// Real rAF invokes the callback with a DOMHighResTimeStamp; setTimeout(fn, 0)
+// alone calls fn() with no args, so callbacks expecting a numeric timestamp
+// (e.g. `t.toFixed(2)`, frame-time-delta math) got `undefined` and threw.
+globalThis.requestAnimationFrame = (fn) => setTimeout(() => fn(globalThis.performance.now()), 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
@@ -522,6 +611,8 @@ class Node {
           }
         }
       }
+    } else if (c instanceof Element && c.tagName === 'IFRAME') {
+      __registerDynamicIframe(c);
     }
     return c;
   }
@@ -844,7 +935,7 @@ function _applyDocQueryEncoding(u) {
   let decoded;
   try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
   let reencoded;
-  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  try { reencoded = __obscura_core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
   catch (e) { return u; }
   const newSearch = '?' + reencoded;
   if (newSearch === u.search) return u;
@@ -1652,6 +1743,7 @@ class Element extends Node {
   set src(v) {
     this.setAttribute("src", v);
     if (this.localName === 'iframe' && v && v !== 'about:blank') {
+      __registerDynamicIframe(this);
       this._loadIframeSrc(v);
     }
   }
@@ -1686,13 +1778,29 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    const frameId = this.__obscuraFrameId || this.getAttribute('data-obscura-frame-id');
+    if (frameId) {
+      try {
+        const meta = _frameMeta(frameId);
+        if (meta && meta.sameOrigin === false) return null;
+        const html = _frameHtml(frameId);
+        if (html) {
+          this._iframeDoc = new _IframeDocument(html, meta?.url || this.src || 'about:blank', this);
+          this._iframeWin = new _IframeWindow(this._iframeDoc, meta?.url || this.src || 'about:blank');
+          this._iframeWin.frameElement = this;
+          this._iframeWin.parent = globalThis;
+          this._iframeWin.top = globalThis.top || globalThis;
+          return this._iframeDoc;
+        }
+      } catch (e) {}
+    }
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
       if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
         return this._iframeDoc;
       }
-      return null; // Cross-origin: blocked
+      return null;
     }
     if (!this._iframeDoc) {
       this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
@@ -1702,6 +1810,22 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    const frameId = this.__obscuraFrameId || this.getAttribute('data-obscura-frame-id');
+    if (frameId) {
+      try {
+        const meta = _frameMeta(frameId);
+        if (meta && meta.sameOrigin === false) {
+          if (!this._iframeWin) {
+            this._iframeDoc = null;
+            this._iframeWin = new _IframeWindow({ body: null }, meta?.url || this.src || 'about:blank');
+            this._iframeWin.frameElement = this;
+            this._iframeWin.parent = globalThis;
+            this._iframeWin.top = globalThis.top || globalThis;
+          }
+          return this._iframeWin;
+        }
+      } catch (e) {}
+    }
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -1779,10 +1903,10 @@ class Element extends Node {
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
-      Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
+      __obscura_core.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
       const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      __obscura_core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
     }
   }
   reset() {
@@ -2123,10 +2247,10 @@ class Document extends Node {
   }
   get title() { return _domParse("document_title") ?? ""; }
   set title(v) {}
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() { return __currentUrl(); }
   get documentURI() { return this.URL; }
   get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  set location(url) { __obscura_core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
@@ -2439,11 +2563,11 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
-    return Deno.core.ops.op_get_cookies();
+    return __obscura_core.ops.op_get_cookies();
   }
   set cookie(v) {
     if (!v) return;
-    Deno.core.ops.op_set_cookie(v);
+    __obscura_core.ops.op_set_cookie(v);
   }
   write(...args) {
     var html = args.join('');
@@ -2618,7 +2742,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscura_core.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -2628,14 +2752,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscura_core.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscura_core.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscura_core.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; __obscura_core.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -2786,6 +2910,37 @@ _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
+// Built once and memoized (not per-getter-call) so navigator.plugins ===
+// navigator.plugins holds, like real Chrome's cached PluginArray. Each
+// plugin gets a real, self-referencing MimeType (length 1, not the empty
+// array a naive stub leaves it with) — fingerprint scripts routinely check
+// `plugins[0][0].enabledPlugin === plugins[0]` and `plugins[0].length > 0`.
+var _pdfPluginArray = null;
+var _pdfMimeTypeArray = null;
+function _buildPdfPluginsAndMimeTypes() {
+  if (_pdfPluginArray) return;
+  var names = [
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ];
+  var plugins = names.map(function(name) {
+    var p = new Plugin(name, "internal-pdf-viewer", "Portable Document Format", []);
+    var mt = new MimeType("application/pdf", "Portable Document Format", "pdf", p);
+    p[0] = mt;
+    p.length = 1;
+    return p;
+  });
+  _pdfPluginArray = new PluginArray(plugins);
+  // navigator.mimeTypes has 2 entries (application/pdf, text/pdf) shared
+  // across the plugin list, cross-referenced to "Chrome PDF Viewer" —
+  // matching real Chrome's PluginList mimetype dedup/resolution.
+  var primary = plugins[1];
+  var mtPdf = new MimeType("application/pdf", "Portable Document Format", "pdf", primary);
+  var mtTextPdf = new MimeType("text/pdf", "Portable Document Format", "pdf", primary);
+  primary[0] = mtPdf;
+  _pdfMimeTypeArray = new MimeTypeArray([mtPdf, mtTextPdf]);
+}
+
 class NetworkInformation {
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
@@ -2805,7 +2960,7 @@ globalThis.ContentIndex = class ContentIndex {};
 
 function _chromeMajor() {
   var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
-  return m ? (m[1] | 0) : 145;
+  return m ? (m[1] | 0) : 147;
 }
 // Chromium derives the sec-ch-ua GREASE brand, version, and brand order
 // deterministically from the Chrome major version
@@ -2831,7 +2986,7 @@ function _uaBrands() {
 }
 
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
+  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
   get language() { return globalThis.__obscura_language || "en-US"; },
   get languages() { return globalThis.__obscura_languages || ["en-US","en"]; },
@@ -2849,19 +3004,12 @@ globalThis.navigator = {
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   get plugins() {
-    return new PluginArray([
-      new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-      new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-    ]);
+    _buildPdfPluginsAndMimeTypes();
+    return _pdfPluginArray;
   },
   get mimeTypes() {
-    return new MimeTypeArray([
-      new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-      new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-    ]);
+    _buildPdfPluginsAndMimeTypes();
+    return _pdfMimeTypeArray;
   },
   userAgentData: {
     mobile: false,
@@ -2949,16 +3097,26 @@ globalThis.navigator = {
   },
 };
 
-// Move navigator.webdriver off the instance and onto a thin prototype so that
-// Object.getOwnPropertyDescriptor(navigator, 'webdriver') returns undefined,
-// matching Chrome where the property lives on Navigator.prototype.
-// Use Navigator.prototype as the chain base so navigator instanceof Navigator === true.
+// navigator is a plain object literal above, so its own [[Prototype]] is
+// Object.prototype unless explicitly relinked — real Chrome's navigator has
+// Navigator.prototype in its chain (`navigator instanceof Navigator` and
+// `Object.getPrototypeOf(navigator) === Navigator.prototype` are both true).
+Object.setPrototypeOf(globalThis.navigator, Navigator.prototype);
+
+// navigator.webdriver lives on Navigator.prototype (not the instance) in real
+// Chrome, so Object.getOwnPropertyDescriptor(navigator, 'webdriver') is
+// undefined while Object.getOwnPropertyDescriptor(Navigator.prototype,
+// 'webdriver') has the getter. An earlier version of this patch inserted an
+// intermediate prototype object between navigator and Navigator.prototype to
+// get the same "no own property" result — but that broke
+// `Object.getPrototypeOf(navigator) === Navigator.prototype`, a one-line
+// check several stealth-detection scripts use specifically to catch this
+// exact prototype-chain-splicing trick. Defining the getter directly on
+// Navigator.prototype matches real Chrome's shape with no extra proto layer.
 (function() {
   var _wdGetter = function() { return false; };
   _markNative(_wdGetter);
-  var _wdProto = Object.create(Navigator.prototype);
-  Object.defineProperty(_wdProto, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
-  Object.setPrototypeOf(globalThis.navigator, _wdProto);
+  Object.defineProperty(Navigator.prototype, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
 })();
 
 globalThis.chrome = {
@@ -2988,6 +3146,10 @@ globalThis.chrome = {
     };
   },
 };
+_markNative(globalThis.chrome.runtime.connect);
+_markNative(globalThis.chrome.runtime.sendMessage);
+_markNative(globalThis.chrome.csi);
+_markNative(globalThis.chrome.loadTimes);
 
 globalThis.Notification = class Notification {
   static permission = "default";
@@ -3171,7 +3333,7 @@ globalThis.fetch = async (input, init = {}) => {
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = await __obscura_core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -3475,14 +3637,14 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 // the input is not a valid URL.
 function _urlParseOp(url, base) {
   try {
-    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const s = __obscura_core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
 }
 function _urlSetOp(href, part, value) {
   try {
-    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const s = __obscura_core.ops.op_url_set(String(href), part, String(value));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
@@ -3491,7 +3653,7 @@ function _urlSetOp(href, part, value) {
 // failure. Cheaper than _urlParseOp for callers that only need the href.
 function _urlResolveOp(href, base) {
   try {
-    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    const r = __obscura_core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
     return r ? r : null;
   } catch (e) { return null; }
 }
@@ -3760,7 +3922,7 @@ if (typeof TextDecoder === 'undefined') {
       if (label === undefined) {
         name = 'utf-8';
       } else {
-        name = Deno.core.ops.op_encoding_for_label(String(label));
+        name = __obscura_core.ops.op_encoding_for_label(String(label));
         if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
       }
       const o = options || {};
@@ -3780,7 +3942,7 @@ if (typeof TextDecoder === 'undefined') {
         return _utf8DecodeBytes(bytes, off);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
-      const r = JSON.parse(Deno.core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
+      const r = JSON.parse(__obscura_core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
       if (!r.ok) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
       return r.v;
     }
@@ -4887,12 +5049,12 @@ globalThis.Crypto = class Crypto {
     if (arr.byteLength > 65536) {
       throw new DOMException("The requested length exceeds 65536 bytes", "QuotaExceededError");
     }
-    const bytes = Deno.core.ops.op_random_bytes(arr.byteLength);
+    const bytes = __obscura_core.ops.op_random_bytes(arr.byteLength);
     new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).set(bytes);
     return arr;
   }
   randomUUID() {
-    const b = Deno.core.ops.op_random_bytes(16);
+    const b = __obscura_core.ops.op_random_bytes(16);
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
     let s = "";
@@ -4941,7 +5103,19 @@ globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
+globalThis.atob = globalThis.atob || ((s) => {
+  const c = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let r = [];
+  for (let i = 0; i < s.length; i += 4) {
+    const a = c.indexOf(s[i]), b = c.indexOf(s[i + 1]), cc = c.indexOf(s[i + 2]), d = c.indexOf(s[i + 3]);
+    r.push((a << 2) | (b >> 4));
+    if (cc >= 0) r.push(((b & 15) << 4) | (cc >> 2));
+    if (d >= 0) r.push(((cc & 3) << 6) | d);
+  }
+  let out = "";
+  for (let i = 0; i < r.length; i += 0x8000) out += String.fromCharCode(...r.slice(i, i + 0x8000));
+  return out;
+});
 
 // Functional History API. The earlier stub returned constant state and was a
 // no-op on push/replace, so any SPA that tried to update its URL (Next.js
@@ -5644,6 +5818,35 @@ class _IframeWindow {
     } catch(e) {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
+
+    // Real cross-origin iframe contentWindow still exposes the standard
+    // Window surface (Worker, WebSocket, customElements, origin, opener,
+    // etc.) even though document/most properties are same-origin-gated.
+    // This stub only had ~25 of those; anything CF's challenge script reads
+    // off the frame's window that isn't set above came back `undefined`
+    // instead of a real reference (observed via a VM register dump: a
+    // slot right next to this object was UNDEF where a real browser would
+    // hold one of these). Mirror whatever's already stubbed on the
+    // top-level globalThis rather than re-declaring each one by hand.
+    const _mirroredGlobals = [
+      'origin', 'customElements', 'indexedDB', 'caches', 'Worker', 'WebSocket',
+      'Notification', 'ResizeObserver', 'MutationObserver', 'IntersectionObserver',
+      'PerformanceObserver', 'MessageChannel', 'MessagePort', 'DOMException',
+      'structuredClone', 'queueMicrotask', 'atob', 'btoa', 'XMLHttpRequest',
+      'Headers', 'Request', 'Response', 'Blob', 'File', 'FileReader', 'FormData',
+      'AbortController', 'AbortSignal', 'requestIdleCallback', 'cancelIdleCallback',
+      'ImageData', 'OffscreenCanvas', 'TextEncoder', 'TextDecoder', 'URL',
+      'URLSearchParams', 'HTMLElement', 'Element', 'Event', 'CustomEvent',
+      'WebGLRenderingContext', 'WebGL2RenderingContext', 'CSSStyleSheet',
+    ];
+    for (const k of _mirroredGlobals) {
+      if (this[k] === undefined && globalThis[k] !== undefined) this[k] = globalThis[k];
+    }
+    // opener is null (not undefined) unless this window was opened via
+    // window.open() from a same-origin script, which never applies here.
+    this.opener = null;
+    this.origin = this.location.origin;
+    this.history = this.history || { length: 1, state: null, back(){}, forward(){}, go(){}, pushState(){}, replaceState(){} };
   }
 
   postMessage(data, origin) {
@@ -5980,8 +6183,18 @@ Element.prototype.getContext = function getContext(type) {
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
     return {
       canvas: this,
-      MAX_VIEWPORT_DIMS: 0x0D33,
+      // GL_VENDOR/RENDERER/VERSION/SHADING_LANGUAGE_VERSION must be exposed
+      // as properties on the context (not just handled in getParameter) —
+      // fingerprint scripts read `gl.getParameter(gl.VERSION)` directly, and
+      // a missing constant resolves to `getParameter(undefined)`, which
+      // returned the array fallback `[0, 0]` instead of a version string
+      // (confirmed live: bot.sannysoft.com/CreepJS-style probes hit this).
+      VENDOR: 0x1F00,
+      RENDERER: 0x1F01,
+      VERSION: 0x1F02,
+      SHADING_LANGUAGE_VERSION: 0x8B8C,
       MAX_TEXTURE_SIZE: 0x0D33,
+      MAX_VIEWPORT_DIMS: 0x0D3A,
       MAX_RENDERBUFFER_SIZE: 0x84E8,
       MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84EA,
       MAX_DRAW_BUFFERS_WEBGL: 0x8824,
@@ -5999,8 +6212,8 @@ Element.prototype.getContext = function getContext(type) {
         if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
         if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
         if (pname === undefined) return [0, 0];
-        // Some properties like MAX_VIEWPORT_DIMS return arrays
-        if (pname === 0x0D33) return [8192, 8192];
+        if (pname === 0x0D33) return 8192;      // GL_MAX_TEXTURE_SIZE (scalar)
+        if (pname === 0x0D3A) return [8192, 8192]; // GL_MAX_VIEWPORT_DIMS (array)
         if (pname === 0x8A2A) return [8192, 8192];
         return 0;
       },
@@ -6528,27 +6741,38 @@ globalThis.Worker = class Worker {
     scope.self = scope;
     return scope;
   }
-  _autoRun() {
-    if (this._terminated || !this._code) return;
+  // Runs the worker's top-level source exactly once and keeps the resulting
+  // scope around, matching how a real worker script actually behaves (its
+  // body runs a single time and only the persistent self.onmessage /
+  // addEventListener('message') handler runs per message afterward).
+  // Previously this same compile-and-run step happened again on every
+  // postMessage(), which threw away any state the script built at top level
+  // (tables, counters, closures) between messages — breaking code, such as a
+  // proof-of-work worker used by Cloudflare's challenge runtime, that sets
+  // something up once and references it from the message handler later.
+  _ensureRun() {
+    if (this._scope || this._terminated || !this._code) return;
     const worker = this;
     const scope = worker._makeScope();
+    worker._scope = scope;
     try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+      const runWorkerSource = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
+      runWorkerSource(scope, scope.postMessage, scope.addEventListener, scope.close);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (worker.onerror) worker.onerror(e);
     }
   }
+  _autoRun() { this._ensureRun(); }
   postMessage(data) {
     if (this._terminated) return;
     const worker = this;
     setTimeout(() => {
       if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
+      worker._ensureRun();
+      const scope = worker._scope;
+      if (!scope) return;
       try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
         const evs = (scope._ev && scope._ev['message']) || [];
         if (evs.length) { for (const h of evs) h({ data }); }
         else if (scope.onmessage) scope.onmessage({ data });
@@ -6776,7 +7000,7 @@ if (!globalThis.crypto.subtle) {
           name !== "SHA-512/224" && name !== "SHA-512/256") {
         throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
       }
-      return bufferOf(Deno.core.ops.op_subtle_digest(name, toBytes(data)));
+      return bufferOf(__obscura_core.ops.op_subtle_digest(name, toBytes(data)));
     },
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
@@ -6816,14 +7040,14 @@ if (!globalThis.crypto.subtle) {
       if (alg.name === "HMAC") {
         const hash = normalizeHash(alg.hash);
         const len = alg.length ? Math.ceil(alg.length / 8) : hashBlockSize(hash);
-        const bytes = Deno.core.ops.op_random_bytes(len);
+        const bytes = __obscura_core.ops.op_random_bytes(len);
         return makeKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: len * 8 }, keyUsages, bytes);
       }
       if (alg.name === "AES-CTR" || alg.name === "AES-CBC" || alg.name === "AES-GCM" || alg.name === "AES-KW") {
         if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256) {
           throw new DOMException("AES key length must be 128, 192, or 256 bits", "OperationError");
         }
-        const bytes = Deno.core.ops.op_random_bytes(alg.length / 8);
+        const bytes = __obscura_core.ops.op_random_bytes(alg.length / 8);
         return makeKey("secret", extractable, { name: alg.name, length: alg.length }, keyUsages, bytes);
       }
       throw new DOMException("generateKey does not support " + alg.name, "NotSupportedError");
@@ -6834,7 +7058,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
+        return bufferOf(runOp(() => __obscura_core.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
       }
       throw new DOMException("sign does not support " + alg.name, "NotSupportedError");
     },
@@ -6844,7 +7068,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        const mac = runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
+        const mac = runOp(() => __obscura_core.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
         const sig = toBytes(signature);
         if (sig.length !== mac.length) return false;
         let diff = 0;
@@ -6865,13 +7089,13 @@ if (!globalThis.crypto.subtle) {
         const hash = normalizeHash(alg.hash);
         const salt = toBytes(alg.salt);
         const iterations = alg.iterations >>> 0;
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
+        return bufferOf(runOp(() => __obscura_core.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
       }
       if (alg.name === "HKDF") {
         const hash = normalizeHash(alg.hash);
         const salt = alg.salt != null ? toBytes(alg.salt) : new Uint8Array(0);
         const info = alg.info != null ? toBytes(alg.info) : new Uint8Array(0);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
+        return bufferOf(runOp(() => __obscura_core.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
       }
       throw new DOMException("deriveBits does not support " + alg.name, "NotSupportedError");
     },
@@ -6921,16 +7145,16 @@ if (!globalThis.crypto.subtle) {
       if (tagLength !== 128) {
         throw new DOMException("Only a 128-bit AES-GCM tag length is supported", "NotSupportedError");
       }
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
+      return bufferOf(runOp(() => __obscura_core.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
     }
     if (alg.name === "AES-CBC") {
       const iv = toBytes(alg.iv);
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
+      return bufferOf(runOp(() => __obscura_core.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
     }
     if (alg.name === "AES-CTR") {
       const counter = toBytes(alg.counter);
       const length = alg.length >>> 0;
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
+      return bufferOf(runOp(() => __obscura_core.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
     }
     throw new DOMException((encrypt ? "encrypt" : "decrypt") + " does not support " + alg.name, "NotSupportedError");
   }
@@ -7361,7 +7585,111 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+function _installTurnstileHook() {
+  if (globalThis.__obscura_turnstile_hook_installed) return;
+  globalThis.__obscura_turnstile_hook_installed = true;
+  let current;
+  const wrap = (turnstile) => {
+    if (!turnstile || typeof turnstile.render !== 'function' || turnstile.__obscuraHooked) {
+      return turnstile;
+    }
+    const originalRender = turnstile.render;
+    turnstile.render = function(container, params) {
+      try {
+        if (params) {
+          if (params.sitekey) globalThis.__capturedSitekey = params.sitekey;
+          if (params.action) globalThis.__capturedAction = params.action;
+          if (params.cData) globalThis.__capturedCdata = params.cData;
+          if (params.chlPageData) globalThis.__capturedChlPageData = params.chlPageData;
+          if (typeof params.callback === 'function') {
+            globalThis.__capturedTurnstileCallback = params.callback;
+          }
+        }
+      } catch (e) {}
+      return originalRender.apply(this, arguments);
+    };
+    try {
+      if (typeof turnstile.getResponse === 'function' && !turnstile.__obscuraGetResponsePatched) {
+        const originalGetResponse = turnstile.getResponse;
+        turnstile.getResponse = function() {
+          if (globalThis.__obscura_turnstile_token) return globalThis.__obscura_turnstile_token;
+          return originalGetResponse.apply(this, arguments);
+        };
+        turnstile.__obscuraGetResponsePatched = true;
+      }
+    } catch (e) {}
+    turnstile.__obscuraHooked = true;
+    return turnstile;
+  };
+  try {
+    Object.defineProperty(globalThis, 'turnstile', {
+      configurable: true,
+      get() { return current; },
+      set(value) { current = wrap(value); },
+    });
+  } catch (e) {}
+  try {
+    if (globalThis.turnstile) wrap(globalThis.turnstile);
+  } catch (e) {}
+}
+
+function _captureTurnstileSitekeyFromDom() {
+  try {
+    const el = document.querySelector('div.cf-turnstile, .cf-turnstile, [data-sitekey]');
+    const key = el && typeof el.getAttribute === 'function' ? el.getAttribute('data-sitekey') : null;
+    if (key && !globalThis.__capturedSitekey) globalThis.__capturedSitekey = key;
+  } catch (e) {}
+  try {
+    const frame = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+    const src = frame && typeof frame.getAttribute === 'function' ? (frame.getAttribute('src') || frame.src || '') : '';
+    if (src && !globalThis.__capturedSitekey) {
+      const m = src.match(/[?&](?:sitekey|k)=([^&#]+)/i);
+      if (m && m[1]) globalThis.__capturedSitekey = decodeURIComponent(m[1]);
+    }
+  } catch (e) {}
+}
+
+function _setTurnstileToken(token) {
+  globalThis.__obscura_turnstile_token = token || '';
+  try {
+    const inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+    for (let i = 0; i < inputs.length; i++) {
+      const input = inputs[i];
+      try {
+        const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        if (desc && typeof desc.set === 'function') desc.set.call(input, token || '');
+        else input.value = token || '';
+      } catch (e) {
+        input.value = token || '';
+      }
+      try { input.setAttribute('value', token || ''); } catch (e) {}
+      try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+    }
+  } catch (e) {}
+  try {
+    if (typeof globalThis.__capturedTurnstileCallback === 'function') {
+      globalThis.__capturedTurnstileCallback(token || '');
+    }
+  } catch (e) {}
+  try {
+    if (globalThis.turnstile && typeof globalThis.turnstile.getResponse === 'function') {
+      globalThis.turnstile.getResponse = function() { return token || ''; };
+    }
+  } catch (e) {}
+  try {
+    if (globalThis.turnstile && typeof globalThis.turnstile.execute === 'function') {
+      globalThis.turnstile.execute();
+    }
+  } catch (e) {}
+}
+
 globalThis.__obscura_init = function() {
+  // Refresh the op-bridge capture from this navigation's fresh isolate, then
+  // remove the global `Deno` so page/CF script sees `typeof Deno === "undefined"`
+  // like a real browser. Must run before the first op call below (_dom).
+  try { if (typeof Deno !== "undefined" && Deno.core) __obscura_core = Deno.core; } catch (e) {}
+  try { delete globalThis.Deno; } catch (e) {}
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
@@ -7369,8 +7697,10 @@ globalThis.__obscura_init = function() {
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
+  _installTurnstileHook();
 
   globalThis.document = new Document(+_dom("document_node_id"));
+  _captureTurnstileSitekeyFromDom();
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
@@ -7887,3 +8217,74 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // arrayBuffer is the body primitive that blob/text/json derive from; the
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
+
+// Bulk native-toString spoofing pass. Sites (Cloudflare's challenge JS
+// included) commonly fingerprint automation by calling
+// Function.prototype.toString on well-known globals and checking for
+// "[native code]" — every JS-implemented stub above needs to be in
+// _nativeFns or that check (and anything branching on it) sees our real
+// source instead. Listed here in bulk rather than at each definition site
+// since misses are easy and the cost of over-marking a name that turns out
+// not to exist is zero (the typeof guard skips it).
+[
+  'fetch', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+  'requestAnimationFrame', 'cancelAnimationFrame', 'queueMicrotask',
+  'addEventListener', 'removeEventListener', 'dispatchEvent',
+  'Worker', 'WebSocket', 'Notification', 'ResizeObserver',
+  'MutationObserver', 'IntersectionObserver', 'PerformanceObserver',
+  'MessageChannel', 'MessagePort', 'WebGLRenderingContext',
+  'WebGL2RenderingContext', 'CSSStyleSheet', 'ShadowRoot',
+  'CustomElementRegistry', 'ElementInternals', 'DOMException',
+  'getComputedStyle', 'getSelection',
+  // Full DOM/Web-API class hierarchy — an earlier pass only covered ~20
+  // hand-picked names; an audit of every `globalThis.X = class/function`
+  // assignment in this file found ~184 more still exposing real JS source
+  // through Function.prototype.toString, including the entire Node/
+  // Element/HTMLElement/Event class tree. Any class-identity or
+  // constructor-toString check (a standard anti-tamper pattern, not just
+  // on bare functions) would see through every one of these.
+  'AnimationEvent', 'Attr', 'Audio', 'AudioBuffer', 'Blob', 'BroadcastChannel',
+  'CDATASection', 'CanvasRenderingContext2D', 'CharacterData', 'ClipboardEvent',
+  'Comment', 'CompositionEvent', 'ContentIndex', 'Crypto', 'CryptoKey',
+  'CustomEvent', 'DOMMatrix', 'DOMParser', 'DOMPoint', 'DOMRect', 'DOMRectList',
+  'DOMTokenList', 'Document', 'DocumentFragment', 'DocumentType', 'Element',
+  'ErrorEvent', 'EventSource', 'EventTarget', 'File', 'FileReader',
+  'FocusEvent', 'FontFace', 'FontFaceSet', 'FormData', 'HTMLAnchorElement',
+  'HTMLAudioElement', 'HTMLBRElement', 'HTMLBodyElement', 'HTMLButtonElement',
+  'HTMLCanvasElement', 'HTMLCollection', 'HTMLDataListElement',
+  'HTMLDetailsElement', 'HTMLDialogElement', 'HTMLDivElement', 'HTMLElement',
+  'HTMLFieldSetElement', 'HTMLFormElement', 'HTMLHRElement', 'HTMLHeadElement',
+  'HTMLHeadingElement', 'HTMLHtmlElement', 'HTMLIFrameElement',
+  'HTMLImageElement', 'HTMLInputElement', 'HTMLLIElement', 'HTMLLabelElement',
+  'HTMLLegendElement', 'HTMLLinkElement', 'HTMLMediaElement', 'HTMLMetaElement',
+  'HTMLOListElement', 'HTMLOptionElement', 'HTMLParagraphElement',
+  'HTMLPreElement', 'HTMLProgressElement', 'HTMLScriptElement',
+  'HTMLSelectElement', 'HTMLSlotElement', 'HTMLSpanElement', 'HTMLStyleElement',
+  'HTMLTableElement', 'HTMLTemplateElement', 'HTMLTextAreaElement',
+  'HTMLUListElement', 'HTMLUnknownElement', 'HTMLVideoElement',
+  'HashChangeEvent', 'Headers', 'Image', 'ImageBitmap', 'ImageData',
+  'InputEvent', 'KeyboardEvent', 'MediaQueryList', 'MessageEvent', 'MouseEvent',
+  'Node', 'OffscreenCanvas', 'Path2D', 'PointerEvent', 'PopStateEvent',
+  'ProcessingInstruction', 'ProgressEvent', 'Range', 'ReadableStream',
+  'Request', 'Response', 'SVGElement', 'SVGSVGElement', 'Screen',
+  'ServiceWorkerContainer', 'SharedWorker', 'StaticRange', 'Storage',
+  'SubmitEvent', 'SubtleCrypto', 'Text', 'TextDecoder', 'TextEncoder',
+  'TransformStream', 'TransitionEvent', 'TreeWalker', 'UIEvent', 'URL',
+  'URLPattern', 'URLSearchParams', 'ValidityState', 'WheelEvent',
+  'WritableStream', 'XMLDocument', 'XMLSerializer', 'createImageBitmap',
+].forEach(name => {
+  const v = globalThis[name];
+  if (typeof v === 'function') _markNative(v);
+});
+[
+  [globalThis.Worker && globalThis.Worker.prototype, ['postMessage', 'terminate', 'addEventListener', 'removeEventListener']],
+  [globalThis.MessagePort && globalThis.MessagePort.prototype, ['postMessage', 'close', 'addEventListener', 'removeEventListener']],
+  [globalThis.ResizeObserver && globalThis.ResizeObserver.prototype, ['observe', 'unobserve', 'disconnect']],
+  [globalThis.MutationObserver && globalThis.MutationObserver.prototype, ['observe', 'disconnect', 'takeRecords']],
+  [globalThis.IntersectionObserver && globalThis.IntersectionObserver.prototype, ['observe', 'unobserve', 'disconnect', 'takeRecords']],
+].forEach(([proto, methods]) => {
+  if (!proto) return;
+  for (const m of methods) {
+    if (typeof proto[m] === 'function') _markNative(proto[m]);
+  }
+});

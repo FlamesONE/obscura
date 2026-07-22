@@ -25,3 +25,21 @@ static V8_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub fn global() -> &'static Mutex<()> {
     V8_LOCK.get_or_init(|| Mutex::new(()))
 }
+
+/// Opt-in (OBSCURA_UNLOCK_NAV_FETCH=1): let a self-managed `Page.navigate`
+/// release this lock across its pure-network primary document fetch, so a
+/// sibling page's V8 work can run on the shared thread during that await
+/// instead of every navigation serializing end-to-end. Off by default — the
+/// narrowed path is a partial "issue-19 Option 1.5" and must clear a
+/// concurrency stress gate before being enabled in production. Cached once:
+/// the dispatch guard and the navigate handler MUST read the same value or
+/// they disagree about who owns the lock (double-lock deadlock / unguarded V8).
+pub fn nav_unlock_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("OBSCURA_UNLOCK_NAV_FETCH").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}

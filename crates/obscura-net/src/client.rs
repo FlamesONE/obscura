@@ -336,7 +336,7 @@ impl ObscuraHttpClient {
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".to_string(),
             ),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
@@ -455,7 +455,7 @@ impl ObscuraHttpClient {
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
                 HeaderValue::from_str(&sec_ch_ua)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"147\", \"Chromium\";v=\"147\"")),
             );
             headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
             headers.insert(
@@ -465,7 +465,7 @@ impl ObscuraHttpClient {
             );
             headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
@@ -534,11 +534,15 @@ impl ObscuraHttpClient {
             }
 
             self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("obscura_net hop start: {} {}", method, current_url);
+            let hop_started = std::time::Instant::now();
             let resp = req_builder.send().await.map_err(|e| {
                 self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("obscura_net hop failed after {:?}: {}", hop_started.elapsed(), e);
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
             self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("obscura_net hop done in {:?}: status {}", hop_started.elapsed(), resp.status());
 
             let status = resp.status();
 

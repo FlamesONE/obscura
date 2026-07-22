@@ -610,7 +610,7 @@ async fn run_fetch(
         });
     }
 
-    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
+    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition, false)).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",

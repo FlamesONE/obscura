@@ -46,6 +46,13 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct FrameSnapshot {
+    pub html: String,
+    pub url: String,
+    pub same_origin: bool,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -63,6 +70,12 @@ pub struct ObscuraState {
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
+    // (node_id, resolved_src) of <iframe> elements inserted into the DOM at
+    // runtime (dynamic append / .src=). Drained by the page loop, which loads
+    // each frame through the same path as static iframes so its scripts run.
+    // This is how a Cloudflare Turnstile widget iframe (created by api.js at
+    // runtime, never present in the initial HTML) gets a live runtime.
+    pub pending_iframe_loads: Vec<(u32, String)>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -77,6 +90,7 @@ pub struct ObscuraState {
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
     pub fetched_urls: Vec<String>,
+    pub frame_snapshots: HashMap<String, FrameSnapshot>,
 }
 
 impl ObscuraState {
@@ -92,6 +106,7 @@ impl ObscuraState {
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
+            pending_iframe_loads: Vec::new(),
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -100,6 +115,7 @@ impl ObscuraState {
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
+            frame_snapshots: HashMap::new(),
         }
     }
 }
@@ -562,12 +578,19 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     // promise never settles, and the JS XHR is stuck at readyState 1 with no
     // completion event (which stranded Angular HttpClient). On timeout reqwest's
     // send().await errors, which op_fetch_url propagates and the fetch shim turns
-    // into an XHR `error`/`loadend`. 30s matches the other clients in the
-    // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
+    // into an XHR `error`/`loadend`. Was 30s (matching other clients in the
+    // workspace) but that's longer than execute_scripts' own soft deadline
+    // (OBSCURA_SCRIPT_DEADLINE_MS, default 10s) and its hard watchdog
+    // (+1000ms) — a page whose on-load script makes one stalling XHR against
+    // a flaky upstream (proxy or origin) would hold the whole navigation for
+    // the full 30s regardless of --wait-until, since a classic <script> runs
+    // to completion before execute_scripts() returns. 15s halves that worst
+    // case while staying generous for real slow-but-alive servers.
+    // OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
     let timeout_ms: u64 = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
+        .unwrap_or(15_000);
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -875,7 +898,7 @@ async fn op_fetch_url(
         if !custom_headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
             req = req.header(
                 "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             );
         }
 
@@ -1339,12 +1362,48 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+#[op2]
+#[string]
+fn op_frame_html(state: &OpState, #[string] frame_id: &str) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    gs.frame_snapshots
+        .get(frame_id)
+        .map(|snapshot| snapshot.html.clone())
+        .unwrap_or_default()
+}
+
+#[op2]
+#[serde]
+fn op_frame_meta(state: &OpState, #[string] frame_id: &str) -> serde_json::Value {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    if let Some(snapshot) = gs.frame_snapshots.get(frame_id) {
+        serde_json::json!({
+            "url": snapshot.url,
+            "sameOrigin": snapshot.same_origin,
+        })
+    } else {
+        serde_json::json!(null)
+    }
+}
+
 #[op2(fast)]
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+// Registers an <iframe> that page JS inserted at runtime so the page loop can
+// load+execute it. Mirrors op_navigate: pure enqueue, the heavy lifting (fetch,
+// parse, child runtime, script execution) happens Rust-side on drain.
+#[op2(fast)]
+fn op_register_dynamic_iframe(state: &OpState, #[smi] node_id: u32, #[string] src: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.pending_iframe_loads.push((node_id, src.to_string()));
 }
 
 #[op2(async)]
@@ -1830,7 +1889,10 @@ pub fn build_extension() -> Extension {
             op_fetch_url(),
             op_get_cookies(),
             op_set_cookie(),
+            op_frame_html(),
+            op_frame_meta(),
             op_navigate(),
+            op_register_dynamic_iframe(),
             op_sleep(),
             op_binding_called(),
             op_subtle_digest(),

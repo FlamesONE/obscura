@@ -17,20 +17,24 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{Response, ObscuraNetError};
 
+// wreq_util 3.0.0-rc.12's Chrome147 profile ignores `.platform(...)` entirely
+// (verified: Windows and MacOS both still produce the Linux-captured header
+// set — an upstream bug in this pre-release crate, not something fixable
+// from our call site: default_headers() and even a per-request .header()
+// override both get clobbered by wreq's own emulation layer before send).
+// Given the wire-level User-Agent/sec-ch-ua-platform are stuck as Linux, the
+// JS-visible identity below is set to match instead of fighting it — a site
+// comparing wire headers against JS-reported navigator would otherwise see
+// two different operating systems for one "browser".
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 #[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
+pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Linux x86_64";
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
+pub const STEALTH_UA_PLATFORM: &str = "Linux";
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+pub const STEALTH_UA_PLATFORM_VERSION: &str = "";
 
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
@@ -47,19 +51,59 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        // .platform() is currently a no-op for Chrome147 in wreq_util
+        // 3.0.0-rc.12 (see STEALTH_USER_AGENT's doc comment) — kept as
+        // Windows so this starts working for free once upstream fixes it,
+        // rather than left on the Linux value that happens to match today.
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
+            .profile(wreq_util::Profile::Chrome147)
             .platform(wreq_util::Platform::Windows)
             .build();
 
+        // This one timeout bounds both the main-document fetch (`fetch()`,
+        // called once per navigation) and every scripted fetch()/XHR a page
+        // makes during execute_scripts() (`send_single()`). It used to be a
+        // hardcoded 15s to keep worst-case navigation hangs short, but that
+        // cut off Cloudflare's own challenge-platform script fetch on slower
+        // residential-proxy hops (observed: a legitimate, non-hanging
+        // response arriving at ~15-20s got killed mid-flight, leaving the
+        // interactive challenge permanently stuck). Override via
+        // OBSCURA_STEALTH_TIMEOUT_MS for slow proxies. The default is derived
+        // to sit ABOVE the whole-navigation budget (OBSCURA_NAV_TIMEOUT_MS,
+        // page.rs navigate_with_wait_post) so this per-request cap can never
+        // preempt a slow-but-legit fetch the nav-level deadline would still
+        // allow — the nav ceiling reaps it with an informative error instead
+        // of this lower cap silently cutting the Cloudflare challenge fetch
+        // mid-flight (the flat 20s default did exactly that against a 30s nav
+        // budget). Tracking the nav env means bumping the nav budget alone
+        // can't re-introduce the inversion. (See op_fetch_url's
+        // OBSCURA_FETCH_TIMEOUT_MS in obscura-js/src/ops.rs for the op-level cap.)
+        let stealth_timeout_ms: u64 = std::env::var("OBSCURA_STEALTH_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                let nav_ms = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(30_000u64);
+                nav_ms + 5_000
+            });
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_millis(stealth_timeout_ms))
             .redirect(wreq::redirect::Policy::none());
 
         if let Some(proxy) = proxy_url {
-            if let Ok(p) = wreq::Proxy::all(proxy) {
-                builder = builder.proxy(p);
+            match wreq::Proxy::all(proxy) {
+                Ok(p) => builder = builder.proxy(p),
+                // A proxy wreq can't parse used to be dropped silently, so every
+                // fetch then left the box's own IP. For a CF-gated host that
+                // means a much harder challenge from the wrong IP, and a
+                // cf_clearance minted on the intended sticky IP won't match.
+                // Surface it loudly instead of failing open to a direct route.
+                Err(e) => tracing::error!(
+                    "proxy {proxy:?} rejected by wreq ({e}); requests will go DIRECT from this host's IP"
+                ),
             }
         }
 
@@ -104,11 +148,15 @@ impl StealthHttpClient {
             }
 
             self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("wreq hop start: {}", current_url);
+            let hop_started = std::time::Instant::now();
             let resp = req.send().await.map_err(|e| {
                 self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("wreq hop failed after {:?}: {}", hop_started.elapsed(), e);
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
             self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("wreq hop done in {:?}: status {}", hop_started.elapsed(), resp.status());
 
             let status = resp.status();
 

@@ -24,7 +24,7 @@ impl Page {
     /// Navigate to URL and wait for load.
     pub async fn goto(&mut self, url: &str) -> Result<(), Error> {
         self.inner
-            .navigate_with_wait(url, WaitUntil::Load)
+            .navigate_with_wait(url, WaitUntil::Load, false)
             .await
             .map_err(|e| Error::Navigation(e.to_string()))
     }

@@ -102,6 +102,40 @@ fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     }
 }
 
+fn frame_security_origin(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    }
+}
+
+// Opt-in: run JS inside cross-origin child frames too (default browser
+// behaviour is a separate context per origin, which obscura models but
+// normally leaves script-less for non-same-origin frames). Needed to let a
+// Cloudflare Turnstile widget iframe (challenges.cloudflare.com) actually
+// execute so its interactive challenge can be driven. Off by default —
+// executing arbitrary third-party frame JS is a bigger attack/behaviour
+// surface, so callers turn it on explicitly for challenge-solving flows.
+fn cross_origin_frames_enabled() -> bool {
+    matches!(
+        std::env::var("OBSCURA_CROSS_ORIGIN_FRAMES").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn frame_is_same_origin(parent: Option<&Url>, child: Option<&Url>) -> bool {
+    let Some(child) = child else { return true; };
+    if matches!(child.scheme(), "about" | "data") {
+        return true;
+    }
+    let Some(parent) = parent else { return false; };
+    if matches!(parent.scheme(), "about" | "data") {
+        return true;
+    }
+    frame_security_origin(parent) == frame_security_origin(child)
+}
+
 /// Escape a value for safe inclusion inside a JavaScript template
 /// literal. The previous implementation only escaped `\`, `` ` `` and
 /// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
@@ -146,9 +180,54 @@ pub struct StoredResponseBody {
     pub base64_encoded: bool,
 }
 
+pub struct PageFrame {
+    pub frame_id: String,
+    pub parent_frame_id: Option<String>,
+    pub owner_node_id: Option<u32>,
+    pub name: Option<String>,
+    pub url: Option<Url>,
+    pub dom: Option<DomTree>,
+    pub js: Option<ObscuraJsRuntime>,
+    pub lifecycle: LifecycleState,
+    pub title: String,
+    pub encoding: String,
+}
+
+impl PageFrame {
+    fn new(frame_id: String, parent_frame_id: Option<String>, owner_node_id: Option<u32>, name: Option<String>) -> Self {
+        Self {
+            frame_id,
+            parent_frame_id,
+            owner_node_id,
+            name,
+            url: None,
+            dom: None,
+            js: None,
+            lifecycle: LifecycleState::Idle,
+            title: String::new(),
+            encoding: "UTF-8".to_string(),
+        }
+    }
+
+    pub fn url_string(&self) -> String {
+        self.url
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "about:blank".to_string())
+    }
+
+    pub fn security_origin(&self) -> String {
+        self.url
+            .as_ref()
+            .map(frame_security_origin)
+            .unwrap_or_else(|| "about:blank".to_string())
+    }
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
+    pub frames: Vec<PageFrame>,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
     pub js: Option<ObscuraJsRuntime>,
@@ -170,6 +249,7 @@ pub struct Page {
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
+    frame_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
@@ -183,6 +263,12 @@ pub struct Page {
     pub emulation_locale: Option<String>,
     pub emulation_languages: Option<Vec<String>>,
     pub emulation_hardware_concurrency: Option<u32>,
+    /// Held ONLY while a self-managed navigation owns the process-wide V8 lock
+    /// (OBSCURA_UNLOCK_NAV_FETCH on). `Some` between the V8 phases of a
+    /// navigation, `take()`n and dropped across the pure-network primary fetch
+    /// so a sibling page can run V8 meanwhile, then re-acquired before any V8
+    /// work resumes. `None` on every other path (the caller owns the lock).
+    nav_v8_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -214,7 +300,8 @@ impl Page {
 
         Page {
             id,
-            frame_id,
+            frame_id: frame_id.clone(),
+            frames: vec![PageFrame::new(frame_id, None, None, None)],
             url: None,
             dom: None,
             js: None,
@@ -229,6 +316,7 @@ impl Page {
             response_bodies: std::collections::HashMap::new(),
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
+            frame_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
@@ -237,8 +325,376 @@ impl Page {
             emulation_locale: None,
             emulation_languages: None,
             emulation_hardware_concurrency: None,
+            nav_v8_guard: None,
             #[cfg(feature = "stealth")]
             stealth_client,
+        }
+    }
+
+    pub fn root_frame(&self) -> Option<&PageFrame> {
+        self.frames.iter().find(|f| f.frame_id == self.frame_id)
+    }
+
+    pub fn root_frame_mut(&mut self) -> Option<&mut PageFrame> {
+        let frame_id = self.frame_id.clone();
+        self.frames.iter_mut().find(|f| f.frame_id == frame_id)
+    }
+
+    pub fn frame(&self, frame_id: &str) -> Option<&PageFrame> {
+        self.frames.iter().find(|f| f.frame_id == frame_id)
+    }
+
+    pub fn frame_mut(&mut self, frame_id: &str) -> Option<&mut PageFrame> {
+        self.frames.iter_mut().find(|f| f.frame_id == frame_id)
+    }
+
+    pub fn child_frames(&self, parent_frame_id: &str) -> Vec<&PageFrame> {
+        self.frames
+            .iter()
+            .filter(|f| f.parent_frame_id.as_deref() == Some(parent_frame_id))
+            .collect()
+    }
+
+    fn next_child_frame_id(&mut self) -> String {
+        self.frame_counter += 1;
+        format!("{}:frame-{}", self.id, self.frame_counter)
+    }
+
+    pub fn rebuild_root_child_frames(&mut self) {
+        let root_frame_id = self.frame_id.clone();
+        self.frames.retain(|f| f.frame_id == root_frame_id || f.parent_frame_id.as_deref() != Some(root_frame_id.as_str()));
+        let mut discovered = Vec::new();
+        if let Some(dom) = self.dom.as_ref() {
+            let iframe_ids = dom.query_selector_all("iframe[src]").unwrap_or_default();
+            for nid in iframe_ids {
+                let Some(node) = dom.get_node(nid) else { continue; };
+                let src = node.get_attribute("src").map(|s| s.to_string()).unwrap_or_default();
+                if src.is_empty() || src == "about:blank" {
+                    continue;
+                }
+                let name = node.get_attribute("name").map(|s| s.to_string());
+                let url = if src.starts_with("http://") || src.starts_with("https://") {
+                    Url::parse(&src).ok()
+                } else {
+                    self.url.as_ref().and_then(|base| base.join(&src).ok())
+                };
+                discovered.push((nid.raw(), name, url));
+            }
+        }
+        let mut new_frames = Vec::new();
+        for (owner_node_id, name, url) in discovered {
+            let frame_id = self.next_child_frame_id();
+            if let Some(dom) = self.dom.as_ref() {
+                let _ = dom.with_node_mut(obscura_dom::NodeId::new(owner_node_id), |owner| {
+                    owner.set_attribute("data-obscura-frame-id", frame_id.clone());
+                });
+            }
+            let mut frame = PageFrame::new(frame_id, Some(root_frame_id.clone()), Some(owner_node_id), name);
+            frame.url = url;
+            new_frames.push(frame);
+        }
+        self.frames.extend(new_frames);
+    }
+
+    pub async fn load_child_frames(&mut self) {
+        let root_frame_id = self.frame_id.clone();
+        let child_ids: Vec<String> = self
+            .frames
+            .iter()
+            .filter(|f| f.parent_frame_id.as_deref() == Some(root_frame_id.as_str()))
+            .map(|f| f.frame_id.clone())
+            .collect();
+
+        for child_id in child_ids {
+            self.load_one_child_frame(&child_id).await;
+        }
+    }
+
+    /// Fetch, parse and (for same-origin or when cross-origin frames are
+    /// enabled) execute the scripts of a single already-registered child
+    /// frame. Extracted from load_child_frames so the dynamic-iframe path
+    /// (process_pending_iframe_loads) can drive the exact same load for a
+    /// frame inserted at runtime, not just ones present in the initial HTML.
+    async fn load_one_child_frame(&mut self, child_id: &str) {
+        let parent_url = self.url.clone();
+        {
+            let child_url = self.frame(child_id).and_then(|f| f.url.clone());
+            let Some(url) = child_url else { return; };
+
+            let loaded = if url.scheme() == "data" {
+                let body_bytes = decode_data_uri(url.as_str()).unwrap_or_default();
+                let content_type = url.as_str()
+                    .strip_prefix("data:")
+                    .and_then(|s| s.split(',').next())
+                    .unwrap_or("text/html")
+                    .split(';')
+                    .next()
+                    .unwrap_or("text/html")
+                    .to_string();
+                let body_text = if content_type.contains("text/html") {
+                    obscura_net::decode_response(&body_bytes, Some(&content_type))
+                } else {
+                    obscura_net::decode_non_html(&body_bytes, Some(&content_type))
+                };
+                Some((parse_html(&body_text), content_type))
+            } else if url.scheme() == "about" {
+                Some((parse_html("<!DOCTYPE html><html><head></head><body></body></html>"), "text/html".to_string()))
+            } else {
+                match self.do_fetch(&url).await {
+                    Ok(resp) => {
+                        let (body_text, encoding_name) = obscura_net::decode_response_with_name(&resp.body, resp.content_type());
+                        Some((parse_html(&body_text), encoding_name.to_string()))
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to load child frame {}: {}", url, e);
+                        None
+                    }
+                }
+            };
+
+            if let Some((dom, encoding)) = loaded {
+                if let Some(frame) = self.frame_mut(child_id) {
+                    frame.dom = Some(dom);
+                    frame.encoding = encoding;
+                    frame.lifecycle = LifecycleState::Loaded;
+                    if let Some(dom) = frame.dom.as_ref() {
+                        frame.title = dom
+                            .query_selector("title")
+                            .ok()
+                            .flatten()
+                            .map(|title_id| dom.text_content(title_id))
+                            .unwrap_or_default();
+                    }
+                }
+            }
+
+            let can_init_runtime = self
+                .frame(child_id)
+                .map(|frame| {
+                    frame.dom.is_some()
+                        && (frame_is_same_origin(parent_url.as_ref(), frame.url.as_ref())
+                            || cross_origin_frames_enabled())
+                })
+                .unwrap_or(false);
+            if can_init_runtime {
+                self.init_child_frame_runtime(child_id);
+                self.execute_child_frame_scripts(child_id).await;
+            }
+        }
+    }
+
+    fn suspend_frame_runtime(frame: &mut PageFrame) {
+        if let Some(js) = &frame.js {
+            if let Some(dom) = js.take_dom() {
+                frame.dom = Some(dom);
+            }
+        }
+        frame.js = None;
+    }
+
+    fn suspend_child_frame_runtimes(&mut self) {
+        for frame in self.frames.iter_mut().filter(|frame| frame.frame_id != self.frame_id) {
+            Self::suspend_frame_runtime(frame);
+        }
+    }
+
+    fn suspend_all_runtimes(&mut self) {
+        self.suspend_child_frame_runtimes();
+        if let Some(js) = &self.js {
+            if let Some(dom) = js.take_dom() {
+                self.dom = Some(dom);
+            }
+        }
+        self.js = None;
+    }
+
+    fn init_child_frame_runtime(&mut self, frame_id: &str) {
+        let proxy_url = self.context.proxy_url.clone();
+        let cookie_jar = self.context.cookie_jar.clone();
+        let blocked_url_patterns = self.blocked_url_patterns.clone();
+        let intercept_tx = self.intercept_tx.clone();
+        let intercept_enabled = self.intercept_enabled;
+        let emulation_locale = self.emulation_locale.clone();
+        let emulation_languages = self.emulation_languages.clone();
+        let emulation_hardware_concurrency = self.emulation_hardware_concurrency;
+        let context_platform = self.context.platform.clone();
+        let context_ua_platform = self.context.ua_platform.clone();
+        let context_ua_platform_version = self.context.ua_platform_version.clone();
+        let http_client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_enabled = self.stealth_client.is_some();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
+        let user_agent = self.http_client.user_agent.try_read().ok().map(|ua| ua.clone());
+
+        let Some(frame) = self.frame_mut(frame_id) else { return; };
+        if frame.js.is_some() {
+            return;
+        }
+        let Some(dom) = frame.dom.take() else { return; };
+        let frame_url = frame.url_string();
+        let frame_encoding = frame.encoding.clone();
+        let frame_title = frame.title.clone();
+
+        let mut rt = ObscuraJsRuntime::with_options(
+            &frame_url,
+            proxy_url,
+            cookie_jar.clone(),
+            #[cfg(feature = "stealth")]
+            stealth_enabled,
+            #[cfg(not(feature = "stealth"))]
+            false,
+        );
+        rt.set_url(&frame_url);
+        rt.set_encoding(&frame_encoding);
+        rt.set_title(&frame_title);
+        #[cfg(feature = "stealth")]
+        if stealth_enabled {
+            rt.set_stealth(true);
+            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_platform(
+                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
+                obscura_net::STEALTH_UA_PLATFORM,
+                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+            );
+        } else {
+            if let Some(ua) = user_agent.as_deref() {
+                rt.set_user_agent(ua);
+            }
+            rt.set_platform(
+                &context_platform,
+                &context_ua_platform,
+                &context_ua_platform_version,
+            );
+        }
+        #[cfg(not(feature = "stealth"))]
+        {
+            if let Some(ua) = user_agent.as_deref() {
+                rt.set_user_agent(ua);
+            }
+            rt.set_platform(
+                &context_platform,
+                &context_ua_platform,
+                &context_ua_platform_version,
+            );
+        }
+        if let Some((lat, lon)) = env_geolocation() {
+            rt.set_geolocation(lat, lon);
+        }
+        rt.set_cookie_jar(cookie_jar);
+        rt.set_http_client(http_client);
+        rt.set_blocked_urls(blocked_url_patterns);
+        #[cfg(feature = "stealth")]
+        if let Some(ref stealth) = stealth_client {
+            rt.set_stealth_client(stealth.clone());
+        }
+        if let Some(tx) = intercept_tx {
+            rt.set_intercept_tx(tx);
+        }
+        rt.set_intercept_enabled(intercept_enabled);
+        rt.set_dom(dom);
+        if let Some(lang) = &emulation_locale {
+            let langs = emulation_languages.clone().unwrap_or_else(|| vec![lang.clone()]);
+            rt.set_locale(lang, &langs);
+        }
+        if let Some(hw) = emulation_hardware_concurrency {
+            rt.set_hardware_concurrency(hw);
+        }
+        rt.run_page_init();
+        frame.js = Some(rt);
+    }
+
+    async fn execute_child_frame_scripts(&mut self, frame_id: &str) {
+        let document_base = self.frame(frame_id).and_then(|frame| frame.url.clone());
+        let all_scripts = match self.frame(frame_id).and_then(|frame| frame.js.as_ref()) {
+            Some(js) => js.with_dom(|dom| {
+                let script_ids = dom.query_selector_all("script").unwrap_or_default();
+                let mut scripts = Vec::new();
+                for sid in script_ids {
+                    let Some(node) = dom.get_node(sid) else { continue; };
+                    let src = node.get_attribute("src").map(|s| s.to_string());
+                    let script_type = node.get_attribute("type").unwrap_or("").to_string();
+                    if !script_type.is_empty()
+                        && script_type != "text/javascript"
+                        && script_type != "application/javascript"
+                        && script_type != "module"
+                    {
+                        continue;
+                    }
+                    let inline_code = if src.is_none() {
+                        dom.text_content(sid)
+                    } else {
+                        String::new()
+                    };
+                    if src.is_some() || !inline_code.trim().is_empty() {
+                        scripts.push((src, inline_code));
+                    }
+                }
+                scripts
+            }).unwrap_or_default(),
+            None => return,
+        };
+
+        for (src, inline_code) in all_scripts {
+            if let Some(src_url) = src {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                    src_url
+                } else if let Some(base) = &document_base {
+                    base.join(&src_url).map(|u| u.to_string()).unwrap_or(src_url)
+                } else {
+                    src_url
+                };
+                if !subresource_allowed(self.url.as_ref(), &full_url) || self.should_block_url(&full_url) {
+                    continue;
+                }
+                let Ok(parsed) = Url::parse(&full_url) else { continue; };
+                let resp = match self.do_fetch(&parsed).await {
+                    Ok(resp) => resp,
+                    Err(_) => continue,
+                };
+                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                if let Some(frame) = self.frame_mut(frame_id) {
+                    if let Some(js) = frame.js.as_mut() {
+                        let _ = js.execute_script_guarded(&full_url, &code);
+                    }
+                }
+                continue;
+            }
+            if let Some(frame) = self.frame_mut(frame_id) {
+                if let Some(js) = frame.js.as_mut() {
+                    let _ = js.execute_script_guarded("<frame-inline>", &inline_code);
+                }
+            }
+        }
+    }
+
+    fn sync_frame_snapshots_to_root_runtime(&mut self) {
+        let snapshots: Vec<(String, String, String, bool)> = self
+            .frames
+            .iter()
+            .filter(|frame| frame.frame_id != self.frame_id)
+            .filter_map(|frame| {
+                let html = if let Some(js) = frame.js.as_ref() {
+                    js.with_dom(|dom| dom.outer_html(dom.document())).unwrap_or_default()
+                } else {
+                    frame.dom.as_ref().map(|dom| dom.outer_html(dom.document())).unwrap_or_default()
+                };
+                if html.is_empty() {
+                    return None;
+                }
+                Some((
+                    frame.frame_id.clone(),
+                    html,
+                    frame.url_string(),
+                    frame_is_same_origin(self.url.as_ref(), frame.url.as_ref()),
+                ))
+            })
+            .collect();
+        if let Some(js) = self.js.as_ref() {
+            js.clear_frame_snapshots();
+            for (frame_id, html, url, same_origin) in snapshots {
+                js.set_frame_snapshot(&frame_id, &html, &url, same_origin);
+            }
         }
     }
 
@@ -266,24 +722,21 @@ impl Page {
         self.http_client.fetch(url).await
     }
     fn init_js(&mut self) {
-        // Drop any existing runtime so the JS realm starts clean on
-        // every navigation. The old code reused the V8 isolate and
-        // only re-bound `globalThis.document`, leaving window.onload,
-        // custom window properties and event handlers from the prior
-        // page in place. That made it possible for a page to set
-        // attacker-controlled state, trigger a navigation, and then
-        // run code in the next document's context.
-        if self.js.is_some() {
-            let _ = self.js.take();
-        }
+        self.suspend_child_frame_runtimes();
+        self.js = None;
 
         // Thread the BrowserContext's proxy through to the ES-module loader
         // and op_fetch_url so dynamic imports and JS fetch() honour the
         // configured upstream proxy (#139). When proxy_url is None this is
         // equivalent to with_base_url() (direct connection).
-        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
+        let mut rt = ObscuraJsRuntime::with_options(
             &self.url_string(),
             self.context.proxy_url.clone(),
+            self.context.cookie_jar.clone(),
+            #[cfg(feature = "stealth")]
+            self.stealth_client.is_some(),
+            #[cfg(not(feature = "stealth"))]
+            false,
         );
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
@@ -354,8 +807,8 @@ impl Page {
         }
 
         rt.run_page_init();
-
         self.js = Some(rt);
+        self.sync_frame_snapshots_to_root_runtime();
     }
 
     /// Resolve the document base URL per HTML spec:
@@ -524,11 +977,15 @@ impl Page {
             }
         }
 
-        let client = self.http_client.clone();
+        let http_client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
             let url = url.clone();
             let idx = *idx;
+            let http_client = http_client.clone();
+            #[cfg(feature = "stealth")]
+            let stealth_client = stealth_client.clone();
             async move {
                 let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
                 if parsed.scheme() == "data" {
@@ -555,7 +1012,17 @@ impl Page {
                     };
                     return Some((idx, url, resp));
                 }
-                match client.fetch(&parsed).await {
+                #[cfg(feature = "stealth")]
+                if let Some(ref stealth) = stealth_client {
+                    match stealth.fetch(&parsed).await {
+                        Ok(resp) => return Some((idx, url, resp)),
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            return None;
+                        }
+                    }
+                }
+                match http_client.fetch(&parsed).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -779,15 +1246,18 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
+        // Internal/default entry: the caller already owns the V8 lock (or there
+        // is no dispatcher), so this navigation does NOT self-manage it.
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load, false).await
     }
 
     pub async fn navigate_with_wait(
         &mut self,
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
+        manage_lock: bool,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "", manage_lock).await
     }
 
     pub async fn navigate_with_wait_post(
@@ -796,7 +1266,16 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
+        manage_lock: bool,
     ) -> Result<(), PageError> {
+        // When manage_lock is set, the dispatcher deliberately did NOT take the
+        // process-wide V8 lock for this Page.navigate (OBSCURA_UNLOCK_NAV_FETCH
+        // on), delegating it to us so we can release it across the primary
+        // network fetch. Take it now; navigate_single drops/re-acquires it
+        // around that one V8-free await; we drop it here when the nav is done.
+        if manage_lock {
+            self.nav_v8_guard = Some(obscura_js::v8_lock::global().lock().await);
+        }
         // Hard ceiling on a single end-to-end navigation. Without this a slow
         // primary fetch or a runaway settle loop can hold the V8 lock for
         // arbitrarily long (we've measured 60+ seconds on JS-heavy news
@@ -825,6 +1304,11 @@ impl Page {
                 )))
             }
         };
+        if manage_lock {
+            // Drop whatever guard state the nav left (Some after a normal
+            // finish, None if it timed out mid-fetch) — release the V8 lock.
+            self.nav_v8_guard = None;
+        }
         if result.is_ok() {
             self.push_history(self.url_string());
         }
@@ -842,12 +1326,26 @@ impl Page {
         if max_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
-            // Bounded against both async idle and synchronous microtask storms:
-            // a plain tokio timeout cannot preempt a page that pins the thread
-            // inside V8 (the real-world SPA hang), so settle drives the loop
-            // through the watchdog-guarded path.
-            let _ = js.run_event_loop_bounded(max_ms).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+        // Pump the event loop, then load any iframes the page inserted while it
+        // ran (Turnstile's widget). A freshly-loaded widget runs its own
+        // scripts and posts a token back, so re-pump to let the parent's
+        // challenge script consume it. Loop until quiescent or out of budget.
+        for _ in 0..8 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Some(js) = &mut self.js {
+                // Bounded against both async idle and synchronous microtask
+                // storms: a plain tokio timeout cannot preempt a page that pins
+                // the thread inside V8 (the real-world SPA hang), so settle
+                // drives the loop through the watchdog-guarded path.
+                let _ = js.run_event_loop_bounded(remaining.as_millis() as u64).await;
+            }
+            if !self.process_pending_iframe_loads().await {
+                break;
+            }
         }
     }
 
@@ -930,6 +1428,7 @@ impl Page {
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
+        self.suspend_all_runtimes();
         self.lifecycle = LifecycleState::Loading;
         self.url = Some(url.clone());
         self.network_events.clear();
@@ -991,10 +1490,24 @@ impl Page {
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
             Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
-        } else if method == "POST" {
-            self.http_client.post_form(&url, body).await
         } else {
-            self.do_fetch(&url).await
+            // Release the process-wide V8 lock across the primary document
+            // fetch when this navigation owns it (OBSCURA_UNLOCK_NAV_FETCH on).
+            // do_fetch/post_form are pure network I/O that never enter V8, so
+            // dropping the guard here lets a sibling page's V8 work run on the
+            // shared thread during the await instead of serializing behind us.
+            // take().is_some() drops the guard immediately, BEFORE the await
+            // (no double-hold); we re-acquire before any V8/DOM work resumes.
+            let owned = self.nav_v8_guard.take().is_some();
+            let fetched = if method == "POST" {
+                self.http_client.post_form(&url, body).await
+            } else {
+                self.do_fetch(&url).await
+            };
+            if owned {
+                self.nav_v8_guard = Some(obscura_js::v8_lock::global().lock().await);
+            }
+            fetched
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
@@ -1111,6 +1624,8 @@ impl Page {
         }
 
         self.dom = Some(dom);
+        self.rebuild_root_child_frames();
+        self.load_child_frames().await;
         self.init_js();
 
         // Inject CSS as a global so getComputedStyle and any CSS-aware shim
@@ -1132,7 +1647,7 @@ impl Page {
         }
         if let Some(js) = &mut self.js {
             let _ = js.execute_script("<iframe-load>",
-                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
+                "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var frameId = iframes[i].getAttribute('data-obscura-frame-id'); var src = iframes[i].getAttribute('src'); if (frameId) { iframes[i].__obscuraFrameId = frameId; } if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
         // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
@@ -1221,7 +1736,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
-        self.js = None;
+        self.suspend_all_runtimes();
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
         self.title = String::new();
@@ -1523,12 +2038,7 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        if let Some(js) = &self.js {
-            if let Some(dom) = js.take_dom() {
-                self.dom = Some(dom);
-            }
-        }
-        self.js = None;
+        self.suspend_all_runtimes();
     }
 
     pub fn resume_js(&mut self) {
@@ -1562,6 +2072,62 @@ impl Page {
         } else {
             Vec::new()
         }
+    }
+
+    fn take_pending_iframe_loads(&self) -> Vec<(u32, String)> {
+        if let Some(js) = &self.js {
+            js.take_pending_iframe_loads()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Load any iframes the page inserted at runtime (Turnstile's widget being
+    /// the motivating case). Mirrors process_pending_navigation: drain the
+    /// queue the JS side filled via op_register_dynamic_iframe, register each
+    /// as a child frame, and run it through the same load path as static
+    /// iframes so its scripts execute. Loops so a freshly-loaded frame that
+    /// itself inserts iframes is picked up. Returns true if anything loaded.
+    pub async fn process_pending_iframe_loads(&mut self) -> bool {
+        let mut loaded_any = false;
+        for _ in 0..8 {
+            let pending = self.take_pending_iframe_loads();
+            if pending.is_empty() {
+                break;
+            }
+            let root_id = self.frame_id.clone();
+            for (_node_id, src) in pending {
+                let Some(base) = self.url.clone() else { continue };
+                let Ok(abs) = base.join(&src) else { continue };
+                // Skip empty / about:blank placeholders (Turnstile first appends
+                // an about:blank iframe, then sets the real src — that later
+                // .src= re-registers it, which is the one we want).
+                if abs.scheme() == "about" {
+                    continue;
+                }
+                let frame_id = self.next_child_frame_id();
+                // Tag the live DOM node so its contentDocument/contentWindow
+                // getters read this frame's Rust-executed snapshot (by src —
+                // Turnstile widget srcs are unique per instance).
+                if let Some(js) = &mut self.js {
+                    let tag = format!(
+                        "(function(){{var f=document.querySelector('iframe[src={:?}]');\
+                          if(f){{f.setAttribute('data-obscura-frame-id',{:?});f.__obscuraFrameId={:?};}}}})()",
+                        src, frame_id, frame_id
+                    );
+                    let _ = js.execute_script("<dyn-iframe-tag>", &tag);
+                }
+                let mut frame = PageFrame::new(frame_id.clone(), Some(root_id.clone()), None, None);
+                frame.url = Some(abs);
+                self.frames.push(frame);
+                self.load_one_child_frame(&frame_id).await;
+                loaded_any = true;
+            }
+        }
+        if loaded_any {
+            self.sync_frame_snapshots_to_root_runtime();
+        }
+        loaded_any
     }
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
@@ -1615,6 +2181,7 @@ impl Page {
                 crate::lifecycle::WaitUntil::Load,
                 &method,
                 &body,
+                false, // caller (a click handler) already holds the V8 lock
             )
             .await?;
             Ok(true)
@@ -1667,7 +2234,9 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::url_matches_cdp_pattern;
+    use super::{url_matches_cdp_pattern, BrowserContext, LifecycleState, Page};
+    use std::sync::Arc;
+    use url::Url;
 
     #[test]
     fn url_matches_cdp_pattern_handles_wildcards_across_url_parts() {
@@ -1691,6 +2260,142 @@ mod tests {
             "*://*.gstatic.com/*.woff2",
             "https://fonts.gstatic.com/s/inter/v18/font.woff",
         ));
+    }
+
+    #[test]
+    fn rebuild_root_child_frames_registers_iframes_with_resolved_urls() {
+        let context = Arc::new(BrowserContext::new("test".to_string()));
+        let mut page = Page::new("page-1".to_string(), context);
+        page.url = Some(Url::parse("https://example.com/root/index.html").unwrap());
+        page.dom = Some(obscura_dom::parse_html(
+            r#"<!DOCTYPE html><html><body>
+                <iframe name="same" src="/child"></iframe>
+                <iframe src="https://other.example/frame"></iframe>
+                <iframe src="about:blank"></iframe>
+            </body></html>"#,
+        ));
+
+        page.rebuild_root_child_frames();
+
+        let children = page.child_frames(&page.frame_id);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name.as_deref(), Some("same"));
+        assert_eq!(
+            children[0].url.as_ref().map(|u| u.as_str()),
+            Some("https://example.com/child")
+        );
+        assert_eq!(
+            children[1].url.as_ref().map(|u| u.as_str()),
+            Some("https://other.example/frame")
+        );
+        let root_dom = page.dom.as_ref().expect("root dom present");
+        let iframe_ids = root_dom.query_selector_all("iframe[src]").unwrap();
+        let tagged = root_dom
+            .with_node(iframe_ids[0], |node| node.get_attribute("data-obscura-frame-id").map(|s| s.to_string()))
+            .flatten();
+        assert!(tagged.is_some(), "iframe should be tagged with frame id");
+    }
+
+    #[tokio::test]
+    async fn load_child_frames_populates_dom_and_lifecycle_for_data_iframe() {
+        let context = Arc::new(BrowserContext::new("test".to_string()));
+        let mut page = Page::new("page-1".to_string(), context);
+        page.url = Some(Url::parse("https://example.com/root/index.html").unwrap());
+        page.dom = Some(obscura_dom::parse_html(
+            r#"<!DOCTYPE html><html><body>
+                <iframe name="child" src="data:text/html,<html><head><title>Child</title></head><body><p id='x'>ok</p></body></html>"></iframe>
+            </body></html>"#,
+        ));
+
+        page.rebuild_root_child_frames();
+        page.load_child_frames().await;
+
+        let children = page.child_frames(&page.frame_id);
+        assert_eq!(children.len(), 1);
+        let child = children[0];
+        assert!(child.dom.is_some() || child.js.is_some(), "child frame dom/runtime should load");
+        assert_eq!(child.title, "Child");
+        assert!(matches!(child.lifecycle, LifecycleState::Loaded));
+        let child_dom_text = if let Some(js) = child.js.as_ref() {
+            js.with_dom(|dom| {
+                let pid = dom.query_selector("#x").unwrap().expect("paragraph exists");
+                dom.text_content(pid)
+            }).unwrap_or_default()
+        } else {
+            let child_dom = child.dom.as_ref().expect("child dom present");
+            let pid = child_dom.query_selector("#x").unwrap().expect("paragraph exists");
+            child_dom.text_content(pid)
+        };
+        assert_eq!(child_dom_text, "ok");
+    }
+
+    #[tokio::test]
+    async fn root_runtime_receives_same_origin_child_frame_snapshot() {
+        let context = Arc::new(BrowserContext::new("test".to_string()));
+        let mut page = Page::new("page-1".to_string(), context);
+        page.url = Some(Url::parse("https://example.com/root/index.html").unwrap());
+        page.dom = Some(obscura_dom::parse_html(
+            r#"<!DOCTYPE html><html><body>
+                <iframe name="child" src="data:text/html,<html><head><title>Child</title></head><body><p id='x'>ok</p></body></html>"></iframe>
+            </body></html>"#,
+        ));
+
+        page.rebuild_root_child_frames();
+        page.load_child_frames().await;
+        page.init_js();
+
+        let result = page.evaluate("(() => { const f = document.querySelector('iframe'); return [!!f.contentDocument, f.contentDocument && f.contentDocument.querySelector('#x') && f.contentDocument.querySelector('#x').textContent, !!f.contentWindow]; })()");
+        assert_eq!(result, serde_json::json!([true, "ok", true]));
+    }
+
+    #[tokio::test]
+    async fn load_child_frames_promotes_same_origin_iframe_to_live_runtime() {
+        let context = Arc::new(BrowserContext::new("test".to_string()));
+        let mut page = Page::new("page-1".to_string(), context);
+        page.url = Some(Url::parse("https://example.com/root/index.html").unwrap());
+        page.dom = Some(obscura_dom::parse_html(
+            r#"<!DOCTYPE html><html><body>
+                <iframe name="child" src="data:text/html,<html><head><title>Child</title></head><body><script>window.answer = 42;</script><p id='x'>ok</p></body></html>"></iframe>
+            </body></html>"#,
+        ));
+
+        page.rebuild_root_child_frames();
+        page.load_child_frames().await;
+
+        let child_id = page.child_frames(&page.frame_id).into_iter().next().expect("child frame").frame_id.clone();
+        let child = page.frame_mut(&child_id).expect("child frame by id");
+        let js = child.js.as_mut().expect("same-origin child should have runtime");
+        let answer = js.evaluate("window.answer").expect("script should run");
+        assert_eq!(answer, serde_json::json!(42.0));
+        let child_text = js.with_dom(|dom| {
+            let pid = dom.query_selector("#x").unwrap().expect("paragraph exists");
+            dom.text_content(pid)
+        }).unwrap();
+        assert_eq!(child_text, "ok");
+    }
+
+    #[tokio::test]
+    async fn suspend_js_drops_child_runtime_but_preserves_dom_snapshot() {
+        let context = Arc::new(BrowserContext::new("test".to_string()));
+        let mut page = Page::new("page-1".to_string(), context);
+        page.url = Some(Url::parse("https://example.com/root/index.html").unwrap());
+        page.dom = Some(obscura_dom::parse_html(
+            r#"<!DOCTYPE html><html><body>
+                <iframe name="child" src="data:text/html,<html><head><title>Child</title></head><body><script>window.answer = 42;</script><p id='x'>ok</p></body></html>"></iframe>
+            </body></html>"#,
+        ));
+
+        page.rebuild_root_child_frames();
+        page.load_child_frames().await;
+        page.init_js();
+        page.suspend_js();
+
+        assert!(page.js.is_none(), "root runtime should be gone");
+        let child = page.child_frames(&page.frame_id).into_iter().next().expect("child frame");
+        assert!(child.js.is_none(), "child runtime should be gone");
+        let child_dom = child.dom.as_ref().expect("child dom snapshot should survive suspend");
+        let pid = child_dom.query_selector("#x").unwrap().expect("paragraph exists");
+        assert_eq!(child_dom.text_content(pid), "ok");
     }
 }
 

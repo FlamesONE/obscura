@@ -50,7 +50,17 @@ pub async fn handle(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.http_client.set_extra_headers(header_map.clone()).await;
+                    // In stealth mode the navigation + scripted fetches go through
+                    // stealth_client, NOT http_client — without this, CDP
+                    // Network.setExtraHTTPHeaders is silently dropped (the header
+                    // never reaches the wire). VFS's `cfmlift: mobile` CF-lift
+                    // header, needed for the no-auth centerwithslots endpoint, is
+                    // exactly such a case: missing it returns a Cloudflare 403205.
+                    #[cfg(feature = "stealth")]
+                    if let Some(ref stealth) = page.stealth_client {
+                        stealth.set_extra_headers(header_map).await;
+                    }
                 }
             }
             Ok(json!({}))

@@ -302,9 +302,9 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/145.0.0.0",
+            "Browser": "Chrome/147.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
@@ -586,10 +586,12 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
+        // The interception path holds the V8 lock explicitly (above), so the
+        // navigation must NOT self-manage it — manage_lock=false.
         let result = if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body, false).await
         } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
+            page.navigate_with_wait(&url_owned, wait_until, false).await
         }
         .map_err(|e| e.to_string());
         drop(_v8_guard);
@@ -879,9 +881,9 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.getVersion" => {
             Some(json!({
                 "protocolVersion": "1.3",
-                "product": "Chrome/145.0.0.0",
+                "product": "Chrome/147.0.0.0",
                 "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
                 "jsVersion": "14.5.0.0",
             }))
         }

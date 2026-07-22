@@ -246,10 +246,24 @@ async fn do_navigate(
 
         let nav_method = params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
+        // Page.navigate self-manages the V8 lock when OBSCURA_UNLOCK_NAV_FETCH
+        // is on — matched by the dispatcher, which then skips the lock for this
+        // one method (see dispatch.rs). Every other navigate caller passes false.
+        let manage_lock = obscura_js::v8_lock::nav_unlock_enabled();
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body, manage_lock).await.map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until, manage_lock).await.map_err(|e| e.to_string())?;
+        }
+
+        // Optional settle after navigation: drive the V8 event loop so async
+        // work (timers, fetch() callbacks, CF JS challenge) can complete.
+        // Without this, the V8 event loop stops after navigation returns and
+        // the Cloudflare JS challenge never finishes, leaving the page stuck
+        // on the challenge screen. Default 0 = no settle (backwards compat).
+        let settle_ms = params.get("settleMs").and_then(|v| v.as_u64()).unwrap_or(0);
+        if settle_ms > 0 {
+            page.settle(settle_ms).await;
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
@@ -301,19 +315,30 @@ pub async fn handle(
         }
         "getFrameTree" => {
             let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-            Ok(json!({
-                "frameTree": {
+            fn build_frame_tree(page: &obscura_browser::Page, frame_id: &str) -> serde_json::Value {
+                let frame = page.frame(frame_id).expect("frame must exist");
+                let children: Vec<serde_json::Value> = page
+                    .child_frames(frame_id)
+                    .into_iter()
+                    .map(|child| build_frame_tree(page, &child.frame_id))
+                    .collect();
+                json!({
                     "frame": {
-                        "id": page.frame_id,
+                        "id": frame.frame_id,
                         "loaderId": "initial-loader",
-                        "url": page.url_string(),
+                        "url": frame.url_string(),
                         "domainAndRegistry": "",
-                        "securityOrigin": page.url_string(),
+                        "securityOrigin": frame.security_origin(),
                         "mimeType": "text/html",
                         "adFrameStatus": { "adFrameType": "none" },
+                        "name": frame.name.clone().unwrap_or_default(),
+                        "parentId": frame.parent_frame_id,
                     },
-                    "childFrames": [],
-                }
+                    "childFrames": children,
+                })
+            }
+            Ok(json!({
+                "frameTree": build_frame_tree(page, &page.frame_id)
             }))
         }
         "createIsolatedWorld" => {
@@ -466,7 +491,7 @@ pub async fn handle(
                 };
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
                     let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded).await.map_err(|e| e.to_string())?;
+                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded, false).await.map_err(|e| e.to_string())?;
                     page.history = stash.0;
                     page.history_index = stash.1;
                     (
@@ -507,16 +532,39 @@ pub async fn handle(
                     .to_string(),
             )
         }
-        "captureScreenshot" | "captureSnapshot" => {
-            // Same story as printToPDF: rasterising a page needs a layout and
-            // paint pipeline that Obscura intentionally does not have. Reply
-            // with a clear error so clients can fail fast instead of waiting
-            // on the generic "Unknown Page method" reply.
+        "captureSnapshot" => {
+            // MHTML snapshot — not a raster image, no direct relationship to
+            // obscura-render's PNG rasterizer. Still unimplemented.
             Err(format!(
-                "Page.{method} is not supported by Obscura: no layout or paint engine. \
-                 For visual snapshots, drive a real headless Chromium for the \
-                 screenshot leg of your pipeline and use Obscura for the scraping leg."
+                "Page.{method} is not supported by Obscura: no MHTML serializer. \
+                 Use Runtime.evaluate to extract document.documentElement.outerHTML instead."
             ))
+        }
+        "captureScreenshot" => {
+            // Obscura's own DOM (obscura-dom) is parse-only, no cascade/layout/
+            // paint. We get real pixels by re-parsing the page's already-JS-
+            // executed HTML through obscura-render (Stylo+Taffy via Blitz,
+            // pure-CPU rasterizer) — no browser binary, all in-process Rust.
+            let (html, url) = {
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                let html = page
+                    .evaluate("document.documentElement && document.documentElement.outerHTML")
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                (html, page.url_string())
+            };
+            if html.is_empty() {
+                return Err("Page.captureScreenshot: no document loaded (navigate first)".to_string());
+            }
+
+            let width = params.get("clip").and_then(|c| c.get("width")).and_then(|w| w.as_u64()).unwrap_or(1280) as u32;
+            let height = params.get("clip").and_then(|c| c.get("height")).and_then(|h| h.as_u64()).unwrap_or(720) as u32;
+
+            let png = obscura_render::render_html_to_png(&html, &url, width, height)
+                .map_err(|e| format!("Page.captureScreenshot render failed: {e}"))?;
+
+            Ok(json!({ "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png) }))
         }
         _ => Err(format!("Unknown Page method: {}", method)),
     }
@@ -609,26 +657,93 @@ mod tests {
     /// without an explicit arm, clients see "Unknown Page method" and have
     /// no idea why their screenshot request failed.
     #[tokio::test]
-    async fn capture_screenshot_returns_descriptive_unsupported_error() {
+    async fn capture_screenshot_without_session_errors_clearly() {
+        // No session -> no page -> a clear error, not a panic or blank Ok(()).
         let mut ctx = CdpContext::new();
         let err = handle("captureScreenshot", &json!({}), &mut ctx, &None)
             .await
-            .expect_err("captureScreenshot must error until a real paint exists");
-        assert!(
-            !err.contains("Unknown Page method"),
-            "captureScreenshot must NOT fall through to the catch-all: {err}"
-        );
-        assert!(
-            err.contains("not supported by Obscura"),
-            "error must clearly state screenshot is unsupported: {err}"
-        );
-        // Same for the MHTML snapshot sibling method.
-        let err2 = handle("captureSnapshot", &json!({}), &mut ctx, &None)
+            .expect_err("captureScreenshot needs a session with a loaded page");
+        assert!(!err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test]
+    async fn capture_screenshot_renders_real_png_via_obscura_render() {
+        // Regression for #45 (in reverse): captureScreenshot used to be a
+        // permanent stub. obscura-render (Blitz/Stylo, pure-CPU) now gives it
+        // real pixels — verify the CDP path returns valid, non-blank PNG
+        // bytes for a simple styled page.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{}-session", page_id);
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+        let nav_params = json!({
+            "url": "data:text/html,<body style='background:white'><h1 style='color:blue'>Hi</h1></body>",
+            "waitUntil": "load",
+        });
+        handle("navigate", &nav_params, &mut ctx, &Some(session_id.clone()))
             .await
-            .expect_err("captureSnapshot must error until a real renderer exists");
-        assert!(
-            !err2.contains("Unknown Page method"),
-            "captureSnapshot must NOT fall through: {err2}"
+            .expect("navigate should succeed");
+
+        let result = handle(
+            "captureScreenshot",
+            &json!({"clip": {"width": 200, "height": 100}}),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("captureScreenshot should succeed once a page is loaded");
+
+        let b64 = result["data"].as_str().expect("data must be a base64 string");
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .expect("data must be valid base64");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "must be a valid PNG");
+        assert!(png.len() > 200, "a real render should be more than a near-empty PNG");
+    }
+
+    #[tokio::test]
+    async fn capture_snapshot_returns_descriptive_unsupported_error() {
+        // MHTML snapshot has no relationship to obscura-render's PNG path —
+        // still an explicit, descriptive stub.
+        let mut ctx = CdpContext::new();
+        let err = handle("captureSnapshot", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("captureSnapshot must error until an MHTML serializer exists");
+        assert!(!err.contains("Unknown Page method"));
+        assert!(err.contains("not supported by Obscura"));
+    }
+
+    #[tokio::test]
+    async fn get_frame_tree_includes_registered_child_frames() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{}-session", page_id);
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+        {
+            let page = ctx.get_page_mut(&page_id).expect("page exists");
+            page.url = Some(url::Url::parse("https://example.com/root").unwrap());
+            page.dom = Some(obscura_dom::parse_html(
+                r#"<!DOCTYPE html><html><body><iframe src="/child" name="child"></iframe></body></html>"#,
+            ));
+            page.rebuild_root_child_frames();
+        }
+
+        let result = handle("getFrameTree", &json!({}), &mut ctx, &Some(session_id))
+            .await
+            .expect("getFrameTree should succeed");
+        let children = result["frameTree"]["childFrames"]
+            .as_array()
+            .expect("childFrames array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["frame"]["name"], json!("child"));
+        assert_eq!(
+            children[0]["frame"]["url"],
+            json!("https://example.com/child")
+        );
+        assert_eq!(
+            children[0]["frame"]["parentId"],
+            json!(page_id)
         );
     }
 

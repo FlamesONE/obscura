@@ -302,7 +302,14 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // to confirm it never reaches `JsRuntime::execute_script` or DOM
     // mutation that re-enters V8; `get_session_page_mut` (which can
     // trigger `suspend_js`/`resume_js`) is NOT in the list.
-    let _v8_guard = if is_v8_free_method(&req.method) {
+    let _v8_guard = if is_v8_free_method(&req.method)
+        || (req.method == "Page.navigate" && obscura_js::v8_lock::nav_unlock_enabled())
+    {
+        // Page.navigate self-manages the lock when OBSCURA_UNLOCK_NAV_FETCH is
+        // on (see Page::navigate_with_wait_post), releasing it across the
+        // primary fetch. The navigate handler passes manage_lock=nav_unlock_enabled()
+        // for exactly this method, so the two agree on ownership — do NOT take
+        // it here for any other method or the navigation runs V8 unguarded.
         None
     } else {
         Some(obscura_js::v8_lock::global().lock().await)
