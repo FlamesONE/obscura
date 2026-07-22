@@ -6473,8 +6473,14 @@ globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields 
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
-    this._w = parseInt(canvas.getAttribute('width')) || 300;
-    this._h = parseInt(canvas.getAttribute('height')) || 150;
+    // Honor the width/height IDL property (canvas.width = N) as well as the
+    // content attribute — fingerprint tests size the canvas via the property, and
+    // reading only the attribute left every such canvas at the 300x150 default
+    // (a 16x16 probe encoded a 300x150 PNG → oversized/mismatched → test "error").
+    var pw = (typeof canvas.width === 'number' && canvas.width > 0) ? canvas.width : parseInt(canvas.getAttribute('width'));
+    var ph = (typeof canvas.height === 'number' && canvas.height > 0) ? canvas.height : parseInt(canvas.getAttribute('height'));
+    this._w = pw || 300;
+    this._h = ph || 150;
     // An untouched canvas is transparent black in real Chrome — every pixel
     // [0,0,0,0]. The old code pre-filled it with white+noise, so getImageData on
     // a blank canvas returned opaque ~255 pixels (sannysoft TRANSPARENT_PIXEL
