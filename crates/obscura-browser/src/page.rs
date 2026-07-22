@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
+use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -65,6 +65,21 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+/// `&s[..max]` panics if `max` lands inside a multi-byte char; the evaluated
+/// expression logged below is caller-controlled, so slice it safely.
+/// (`str::floor_char_boundary` would do this but is still unstable.)
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(feature = "stealth")]
@@ -263,12 +278,10 @@ pub struct Page {
     pub emulation_locale: Option<String>,
     pub emulation_languages: Option<Vec<String>>,
     pub emulation_hardware_concurrency: Option<u32>,
-    /// Held ONLY while a self-managed navigation owns the process-wide V8 lock
-    /// (OBSCURA_UNLOCK_NAV_FETCH on). `Some` between the V8 phases of a
-    /// navigation, `take()`n and dropped across the pure-network primary fetch
-    /// so a sibling page can run V8 meanwhile, then re-acquired before any V8
-    /// work resumes. `None` on every other path (the caller owns the lock).
-    nav_v8_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
+    /// Passive on_request/on_response callbacks, scoped to this page (issue
+    /// #408): they fire only for requests this page drives and die with it.
+    /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
+    callbacks: Arc<CallbackRegistry>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -325,7 +338,7 @@ impl Page {
             emulation_locale: None,
             emulation_languages: None,
             emulation_hardware_concurrency: None,
-            nav_v8_guard: None,
+            callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -719,7 +732,9 @@ impl Page {
         if let Some(ref stealth) = self.stealth_client {
             return stealth.fetch(url).await;
         }
-        self.http_client.fetch(url).await
+        self.http_client
+            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .await
     }
     fn init_js(&mut self) {
         self.suspend_child_frame_runtimes();
@@ -778,6 +793,7 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
+        rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -838,12 +854,21 @@ impl Page {
         let document_base = self.resolve_base_url();
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
-        // fetch + execute loop can blow past a 25s Puppeteer goto timeout.
-        // Override via OBSCURA_SCRIPT_DEADLINE_MS for slow networks.
+        // fetch + execute loop can blow past a Puppeteer/Playwright goto
+        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
+        // SPA had its remaining scripts skipped before the app booted, so it
+        // never fired its XHR/fetch calls and page.on('response') saw nothing
+        // (issue #361). Only pages that actually run past the deadline are
+        // affected; fast pages finish and return well before it, so a larger
+        // budget costs them nothing. 30s gives an app room to initialize while
+        // the per-phase watchdog (armed at this + 1s) still bounds a real
+        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
+        // for very heavy SPAs on slow networks (pair it with a matching client
+        // navigation timeout).
         let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000);
+            .unwrap_or(30_000);
         let script_deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -978,12 +1003,14 @@ impl Page {
         }
 
         let http_client = self.http_client.clone();
+        let page_callbacks = self.callbacks.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
         let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
             let url = url.clone();
             let idx = *idx;
             let http_client = http_client.clone();
+            let cbs = page_callbacks.clone();
             #[cfg(feature = "stealth")]
             let stealth_client = stealth_client.clone();
             async move {
@@ -1014,6 +1041,8 @@ impl Page {
                 }
                 #[cfg(feature = "stealth")]
                 if let Some(ref stealth) = stealth_client {
+                    // Stealth path uses the wreq client (Chrome TLS fingerprint);
+                    // passive callbacks stay on the plain-client path below.
                     match stealth.fetch(&parsed).await {
                         Ok(resp) => return Some((idx, url, resp)),
                         Err(e) => {
@@ -1022,7 +1051,7 @@ impl Page {
                         }
                     }
                 }
-                match http_client.fetch(&parsed).await {
+                match http_client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -1248,16 +1277,15 @@ impl Page {
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
         // Internal/default entry: the caller already owns the V8 lock (or there
         // is no dispatcher), so this navigation does NOT self-manage it.
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load, false).await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
     }
 
     pub async fn navigate_with_wait(
         &mut self,
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
-        manage_lock: bool,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "", manage_lock).await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
     }
 
     pub async fn navigate_with_wait_post(
@@ -1266,23 +1294,14 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
-        manage_lock: bool,
     ) -> Result<(), PageError> {
-        // When manage_lock is set, the dispatcher deliberately did NOT take the
-        // process-wide V8 lock for this Page.navigate (OBSCURA_UNLOCK_NAV_FETCH
-        // on), delegating it to us so we can release it across the primary
-        // network fetch. Take it now; navigate_single drops/re-acquires it
-        // around that one V8-free await; we drop it here when the nav is done.
-        if manage_lock {
-            self.nav_v8_guard = Some(obscura_js::v8_lock::global().lock().await);
-        }
         // Hard ceiling on a single end-to-end navigation. Without this a slow
-        // primary fetch or a runaway settle loop can hold the V8 lock for
-        // arbitrarily long (we've measured 60+ seconds on JS-heavy news
-        // sites), wedging every other in-flight CDP request because the
-        // dispatcher holds the lock across the entire handler. 30 seconds
-        // matches reqwest's default per-request timeout — the worst case is
-        // one slow primary GET plus one slow JS-redirect chain step. Override
+        // primary fetch or a runaway settle loop can hold the per-connection V8
+        // lock for arbitrarily long (we've measured 60+ seconds on JS-heavy news
+        // sites), wedging every other in-flight CDP request on this connection
+        // because the dispatcher holds the lock across the entire handler. 30
+        // seconds matches reqwest's default per-request timeout — the worst case
+        // is one slow primary GET plus one slow JS-redirect chain step. Override
         // with `OBSCURA_NAV_TIMEOUT_MS=NN`.
         let nav_timeout_ms: u64 = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
             .ok()
@@ -1304,11 +1323,6 @@ impl Page {
                 )))
             }
         };
-        if manage_lock {
-            // Drop whatever guard state the nav left (Some after a normal
-            // finish, None if it timed out mid-fetch) — release the V8 lock.
-            self.nav_v8_guard = None;
-        }
         if result.is_ok() {
             self.push_history(self.url_string());
         }
@@ -1438,7 +1452,11 @@ impl Page {
                 if self.context.robots_cache.is_allowed(domain, "/robots.txt") {
                     let robots_url = format!("{}://{}/robots.txt", url.scheme(), domain);
                     if let Ok(robots_url) = Url::parse(&robots_url) {
-                        if let Ok(resp) = self.http_client.fetch(&robots_url).await {
+                        if let Ok(resp) = self
+                            .http_client
+                            .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
+                            .await
+                        {
                             if resp.status == 200 {
                                 let body = String::from_utf8_lossy(&resp.body);
                                 self.context.robots_cache.parse_and_store(
@@ -1490,24 +1508,12 @@ impl Page {
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
             Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
+        } else if method == "POST" {
+            self.http_client
+                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .await
         } else {
-            // Release the process-wide V8 lock across the primary document
-            // fetch when this navigation owns it (OBSCURA_UNLOCK_NAV_FETCH on).
-            // do_fetch/post_form are pure network I/O that never enter V8, so
-            // dropping the guard here lets a sibling page's V8 work run on the
-            // shared thread during the await instead of serializing behind us.
-            // take().is_some() drops the guard immediately, BEFORE the await
-            // (no double-hold); we re-acquire before any V8/DOM work resumes.
-            let owned = self.nav_v8_guard.take().is_some();
-            let fetched = if method == "POST" {
-                self.http_client.post_form(&url, body).await
-            } else {
-                self.do_fetch(&url).await
-            };
-            if owned {
-                self.nav_v8_guard = Some(obscura_js::v8_lock::global().lock().await);
-            }
-            fetched
+            self.do_fetch(&url).await
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
@@ -1591,12 +1597,14 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        let page_callbacks = self.callbacks.clone();
         let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
             let client = client.clone();
+            let cbs = page_callbacks.clone();
             let url_str = full_url.clone();
             async move {
                 let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
+                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
                     Ok(resp) => Some((url_str, resp)),
                     Err(e) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
@@ -1763,13 +1771,39 @@ impl Page {
         self.js.as_ref().map(|js| js.fetched_urls()).unwrap_or_default()
     }
 
+    /// Move network events recorded for script-initiated requests
+    /// (fetch/XHR/dynamic resource) from the JS runtime into this page's
+    /// network_events, so the CDP layer emits Network.requestWillBeSent /
+    /// responseReceived for them (issue #406). Idempotent: the runtime's queue
+    /// is drained, so calling this repeatedly does not duplicate events. The
+    /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
+    pub fn sync_js_network_events(&mut self) {
+        let events = match self.js.as_ref() {
+            Some(js) => js.take_js_network_events(),
+            None => return,
+        };
+        for ev in events {
+            self.network_events.push(NetworkEvent {
+                request_id: ev.request_id,
+                url: ev.url,
+                method: ev.method,
+                resource_type: "Fetch".to_string(),
+                status: ev.status,
+                headers: std::collections::HashMap::new(),
+                response_headers: Arc::new(ev.response_headers),
+                body_size: ev.body_size,
+                timestamp: ev.timestamp,
+            });
+        }
+    }
+
     pub fn dom(&self) -> Option<&DomTree> {
         self.dom.as_ref()
     }
 
     /// V8 isolate handle for this page's runtime, if it has been initialized.
     /// Lets the CDP dispatcher arm a per-command watchdog (which bounds any one
-    /// command so a hung page cannot hold the process-wide V8 lock forever)
+    /// command so a hung page cannot hold this connection's V8 lock forever)
     /// without taking `&mut self`.
     pub fn isolate_handle(&self) -> Option<obscura_js::runtime::IsolateHandle> {
         self.js.as_ref().map(|js| js.isolate_handle())
@@ -1795,7 +1829,7 @@ impl Page {
             match js.evaluate_with_timeout(expression, timeout) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error/timeout for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!("JS eval error/timeout for '{}': {}", truncate_on_char_boundary(expression, 80), e);
                     serde_json::Value::Null
                 }
             }
@@ -1809,7 +1843,7 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!("JS eval error for '{}': {}", truncate_on_char_boundary(expression, 80), e);
                     serde_json::Value::Null
                 }
             }
@@ -2004,6 +2038,31 @@ impl Page {
         })
     }
 
+    /// Take a stored response body as raw bytes for CDP streaming
+    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
+    /// transfers ownership to the caller, so a large body is held once and freed
+    /// when the stream is closed rather than lingering in this long-running
+    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
+    /// bodies return their UTF-8 bytes. Returns None if the body was never
+    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
+    /// dropped) or the id is unknown.
+    pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
+        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+            self.response_body_order.retain(|id| id != request_id);
+            body
+        } else {
+            self.js.as_ref()?.get_network_response_body(request_id).map(|b| StoredResponseBody {
+                body: b.body,
+                base64_encoded: b.base64_encoded,
+            })?
+        };
+        if stored.base64_encoded {
+            BASE64.decode(stored.body.as_bytes()).ok()
+        } else {
+            Some(stored.body.into_bytes())
+        }
+    }
+
     /// Make the body stored under `from_id` also retrievable under `to_id`.
     /// The main navigation resource is stored under its internal request id, but
     /// the CDP layer reports it to clients with the navigation's loaderId as the
@@ -2157,33 +2216,40 @@ impl Page {
     }
 
     /// Register a passive callback fired for every JS `fetch()`/XHR (and
-    /// navigation) request, once the method/headers/body are known and before it
-    /// is sent. Non-blocking; use `enable_interception` to mutate or block.
-    pub fn on_request(&mut self, cb: RequestCallback) {
-        if let Ok(mut v) = self.http_client.on_request.try_write() {
-            v.push(cb);
-        }
+    /// navigation) request this page makes, once the method/headers/body are
+    /// known and before it is sent. Non-blocking; use `enable_interception` to
+    /// mutate or block. Returns a stable id; pass it to `off_request` to
+    /// detach (issue #408). Scoped to this page: it never sees sibling pages'
+    /// requests and dies with the page.
+    pub fn on_request(&mut self, cb: RequestCallback) -> u64 {
+        self.callbacks.add_request(cb)
     }
 
     /// Register a passive callback fired with every JS `fetch()`/XHR (and
-    /// navigation) response, including its body. Non-blocking. The main path for
-    /// crawlers that need to capture API response payloads.
-    pub fn on_response(&mut self, cb: ResponseCallback) {
-        if let Ok(mut v) = self.http_client.on_response.try_write() {
-            v.push(cb);
-        }
+    /// navigation) response this page receives, including its body.
+    /// Non-blocking. The main path for crawlers that need to capture API
+    /// response payloads. Returns a stable id for `off_response`. Page-scoped
+    /// like `on_request`.
+    pub fn on_response(&mut self, cb: ResponseCallback) -> u64 {
+        self.callbacks.add_response(cb)
+    }
+
+    /// Detach a request observer registered with `on_request`. Returns true if
+    /// one was removed.
+    pub fn off_request(&mut self, id: u64) -> bool {
+        self.callbacks.remove_request(id)
+    }
+
+    /// Detach a response observer registered with `on_response`. Returns true if
+    /// one was removed.
+    pub fn off_response(&mut self, id: u64) -> bool {
+        self.callbacks.remove_response(id)
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
-            self.navigate_with_wait_post(
-                &url,
-                crate::lifecycle::WaitUntil::Load,
-                &method,
-                &body,
-                false, // caller (a click handler) already holds the V8 lock
-            )
-            .await?;
+            self.navigate_with_wait_post(&url, crate::lifecycle::WaitUntil::Load, &method, &body)
+                .await?;
             Ok(true)
         } else {
             Ok(false)
@@ -2234,9 +2300,21 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{url_matches_cdp_pattern, BrowserContext, LifecycleState, Page};
+    use super::{truncate_on_char_boundary, url_matches_cdp_pattern, BrowserContext, LifecycleState, Page};
     use std::sync::Arc;
     use url::Url;
+
+    #[test]
+    fn truncate_never_splits_a_multibyte_char() {
+        // A caller-supplied expression whose byte 80 lands inside a multi-byte
+        // char would make `&expression[..80]` panic; the helper truncates safely.
+        let s = format!("{}€tail", "a".repeat(79));
+        assert!(!s.is_char_boundary(80), "setup: byte 80 splits the € char");
+        let t = truncate_on_char_boundary(&s, 80);
+        assert!(s.starts_with(t));
+        assert_eq!(t.len(), 79, "should stop right before the € char");
+        assert_eq!(truncate_on_char_boundary("short", 80), "short");
+    }
 
     #[test]
     fn url_matches_cdp_pattern_handles_wildcards_across_url_parts() {

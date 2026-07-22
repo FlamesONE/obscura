@@ -73,12 +73,22 @@ pub fn emit_navigation_events(
         });
     }
 
+    // executionContextsCleared invalidates every prior context id, so a
+    // Runtime.evaluate / callFunctionOn targeting a pre-navigation context
+    // must be rejected (Chrome: "Cannot find context with specified id"). The
+    // default world (id 2) and isolated worlds are re-registered below as their
+    // executionContextCreated events are emitted. Issue #407: previously this
+    // set was insert-only, so stale ids kept validating and grew unbounded.
+    ctx.valid_context_ids.clear();
     let mut phase1 = vec![
         CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
         CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
     ];
+    // The default world is re-created as context id 2; re-register it. Isolated
+    // worlds register themselves via next_isolated_context in the loop below.
+    ctx.valid_context_ids.insert(2);
     let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
         vec!["__puppeteer_utility_world__24.40.0".to_string()]
     } else {
@@ -226,7 +236,11 @@ async fn do_navigate(
     // any file the obscura process can read. Opt in via
     // `obscura serve --allow-file-access` when local-HTML
     // testing is the intended workflow.
-    if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+    let allow_file_access = ctx
+        .get_session_page(session_id)
+        .map(|page| page.context.allow_file_access)
+        .unwrap_or(ctx.default_context.allow_file_access);
+    if url_is_file_scheme(url) && !allow_file_access {
         return Err(
             "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
         );
@@ -246,14 +260,10 @@ async fn do_navigate(
 
         let nav_method = params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        // Page.navigate self-manages the V8 lock when OBSCURA_UNLOCK_NAV_FETCH
-        // is on — matched by the dispatcher, which then skips the lock for this
-        // one method (see dispatch.rs). Every other navigate caller passes false.
-        let manage_lock = obscura_js::v8_lock::nav_unlock_enabled();
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body, manage_lock).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await.map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until, manage_lock).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until).await.map_err(|e| e.to_string())?;
         }
 
         // Optional settle after navigation: drive the V8 event loop so async
@@ -267,6 +277,9 @@ async fn do_navigate(
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
+        // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
+        // emit as Network events alongside static subresources (#406).
+        page.sync_js_network_events();
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
         let page_id = page.id.clone();
@@ -491,7 +504,7 @@ pub async fn handle(
                 };
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
                     let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded, false).await.map_err(|e| e.to_string())?;
+                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded).await.map_err(|e| e.to_string())?;
                     page.history = stash.0;
                     page.history_index = stash.1;
                     (

@@ -14,7 +14,9 @@ pub struct CdpContext {
     pub sessions: HashMap<String, String>, // session_id -> page_id
     pub pending_events: Vec<CdpEvent>,
     pub default_context: Arc<BrowserContext>,
+    pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
     page_counter: u32,
+    browser_context_counter: u32,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
     // World names registered via Page.createIsolatedWorld. After every
@@ -50,6 +52,20 @@ pub struct CdpContext {
     pub emulation_locale: Option<String>,
     pub emulation_languages: Option<Vec<String>>,
     pub emulation_hardware_concurrency: Option<u32>,
+    // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
+    // body taken out of the page cache so a large download is streamed
+    // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
+    // caps how many bodies (and how many bytes) can be held at once, evicting
+    // the oldest, so an abandoned or disconnected stream cannot leak unbounded.
+    pub io_streams: crate::domains::io::IoStreamStore,
+    /// Serializes V8 work within THIS connection. With the thread-per-connection
+    /// server (#430) each connection runs on its own OS thread, so isolates never
+    /// collide across connections; this per-connection lock keeps a connection's
+    /// own nav task and command dispatch from interleaving two of its pages'
+    /// isolates on that one thread. It is deliberately per-connection, not a
+    /// process-wide lock, so connections run in parallel (measured ~2x at
+    /// concurrency 2, ~3x at 4) instead of serializing all V8 on one mutex.
+    pub v8_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CdpContext {
@@ -91,19 +107,40 @@ impl CdpContext {
         Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
     }
 
-    /// Kitchen-sink constructor that also threads `allow_private_network`
-    /// (issue #33). Older `new_with_*` builders stay as-is.
-    pub fn new_full(
-        proxy: Option<String>,
-        stealth: bool,
-        user_agent: Option<String>,
-        storage_dir: Option<std::path::PathBuf>,
-        allow_file_access: bool,
-        allow_private_network: bool,
-    ) -> Self {
-        Self::_new_inner(
-            proxy, stealth, user_agent, storage_dir, allow_file_access, allow_private_network,
-        )
+    /// Build a CDP context around an already-constructed default browser
+    /// context. The server passes a fresh isolated context per WebSocket; tests
+    /// and embedders may construct their own.
+    pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
+        // Pre-seed with the default-frame execution context ids that
+        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise via
+        // Runtime.executionContextCreated. Anything else has to be registered
+        // explicitly (Page.createIsolatedWorld), otherwise
+        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
+        let mut valid_context_ids = HashSet::new();
+        valid_context_ids.insert(1);
+        valid_context_ids.insert(2);
+        CdpContext {
+            pages: Vec::new(),
+            sessions: HashMap::new(),
+            pending_events: Vec::new(),
+            default_context,
+            browser_contexts: HashMap::new(),
+            page_counter: 0,
+            browser_context_counter: 0,
+            preload_scripts: Vec::new(),
+            preload_counter: 0,
+            fetch_intercept: FetchInterceptState::new(),
+            intercept_tx: None,
+            isolated_worlds: Vec::new(),
+            valid_context_ids,
+            next_isolated_context_id: 100,
+            emulation_timezone: None,
+            emulation_locale: None,
+            emulation_languages: None,
+            emulation_hardware_concurrency: None,
+            io_streams: crate::domains::io::IoStreamStore::default(),
+            v8_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     fn _new_inner(
@@ -123,34 +160,7 @@ impl CdpContext {
             allow_private_network,
         );
         ctx.allow_file_access = allow_file_access;
-        let default_context = Arc::new(ctx);
-        // Pre-seed with the default-frame execution context ids that
-        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
-        // via Runtime.executionContextCreated. Anything else has to be
-        // registered explicitly (Page.createIsolatedWorld), otherwise
-        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
-        let mut valid_context_ids = HashSet::new();
-        valid_context_ids.insert(1);
-        valid_context_ids.insert(2);
-
-        CdpContext {
-            pages: Vec::new(),
-            sessions: HashMap::new(),
-            pending_events: Vec::new(),
-            default_context,
-            page_counter: 0,
-            preload_scripts: Vec::new(),
-            preload_counter: 0,
-            fetch_intercept: FetchInterceptState::new(),
-            intercept_tx: None,
-            isolated_worlds: Vec::new(),
-            valid_context_ids,
-            next_isolated_context_id: 100,
-            emulation_timezone: None,
-            emulation_locale: None,
-            emulation_languages: None,
-            emulation_hardware_concurrency: None,
-        }
+        Self::new_with_shared_context(Arc::new(ctx))
     }
 
     /// Claim the next isolated-world execution context id and register it as
@@ -163,19 +173,65 @@ impl CdpContext {
     }
 
     pub fn create_page(&mut self) -> String {
+        self.create_page_in_context(None)
+            .expect("default browser context must exist")
+    }
+
+    pub fn create_page_in_context(&mut self, context_id: Option<&str>) -> Result<String, String> {
+        let context = match context_id {
+            Some(id) => self
+                .browser_context(id)
+                .cloned()
+                .ok_or_else(|| format!("Browser context not found: {}", id))?,
+            None => self.default_context.clone(),
+        };
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
-        let mut page = Page::new(page_id.clone(), self.default_context.clone());
-        // Pass Emulation overrides to new pages
-        if let Some(ref _tz) = self.emulation_timezone {
-            // TZ is set at process level; init_js handles JS overrides
-        }
+        let mut page = Page::new(page_id.clone(), context);
+        // Propagate CDP Emulation overrides to the new page. Timezone is applied
+        // process-wide; init_js handles the JS-side locale/languages/hw overrides.
         page.emulation_locale = self.emulation_locale.clone();
         page.emulation_languages = self.emulation_languages.clone();
         page.emulation_hardware_concurrency = self.emulation_hardware_concurrency;
         page.navigate_blank();
         self.pages.push(page);
-        page_id
+        Ok(page_id)
+    }
+
+    pub fn browser_context(&self, id: &str) -> Option<&Arc<BrowserContext>> {
+        if id == self.default_context.id {
+            Some(&self.default_context)
+        } else {
+            self.browser_contexts.get(id)
+        }
+    }
+
+    pub fn create_browser_context(&mut self) -> String {
+        self.browser_context_counter += 1;
+        let id = format!("context-{}", self.browser_context_counter);
+        let context = Arc::new(self.default_context.isolated_copy(id.clone(), false));
+        self.browser_contexts.insert(id.clone(), context);
+        id
+    }
+
+    pub fn dispose_browser_context(&mut self, id: &str) -> Result<Vec<String>, String> {
+        if id == self.default_context.id {
+            return Err("The default browser context cannot be disposed".to_string());
+        }
+        if self.browser_contexts.remove(id).is_none() {
+            return Err(format!("Browser context not found: {}", id));
+        }
+
+        let page_ids: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|page| page.context.id == id)
+            .map(|page| page.id.clone())
+            .collect();
+        for page_id in &page_ids {
+            self.remove_page(page_id);
+        }
+        Ok(page_ids)
     }
 
     pub fn get_page(&self, id: &str) -> Option<&Page> {
@@ -222,7 +278,7 @@ impl CdpContext {
     }
 }
 
-/// Whether a CDP method can be served WITHOUT acquiring the global V8 lock.
+/// Whether a CDP method can be served WITHOUT acquiring the per-connection V8 lock.
 ///
 /// Methods listed here were audited to confirm they do not transitively
 /// call into a `JsRuntime`. They either don't touch any `Page` at all, or
@@ -267,58 +323,44 @@ fn is_v8_free_method(method: &str) -> bool {
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
-    // V8 lock — the recursive dispatch will acquire it for the inner call,
-    // and tokio Mutex is not reentrant.
+    // per-connection V8 lock — the recursive dispatch will acquire it for the
+    // inner call, and tokio Mutex is not reentrant.
     if req.method == "Target.sendMessageToTarget" {
         return dispatch_send_message_to_target(req, ctx).await;
     }
 
-    // Issue #19: V8 fatal abort under concurrent CDP work.
+    // Issue #430: keep this connection's V8 work serialized on its own thread.
     //
-    // Every CDP handler below may end up calling into a per-Page `JsRuntime`
-    // (each owning its own V8 Isolate). All of them run on a single OS
-    // thread (current_thread tokio + LocalSet). When two pages' V8-touching
-    // futures interleave across an `.await` (which `process_with_interception`
-    // can trigger by handling new CDP messages while a navigation task is in
-    // flight on `spawn_local`), V8 trips the
-    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts the
-    // process via `V8_Fatal` — no Rust panic, just `abort(3)`.
+    // Every CDP handler below may call into a per-Page `JsRuntime` (each owning
+    // its own V8 Isolate). With the thread-per-connection server each connection
+    // runs on its own OS thread, so isolates never collide across connections.
+    // Within one connection, though, a nav task spawned by
+    // `process_with_interception` runs while this processor keeps pumping other
+    // CDP messages, so two of this connection's pages could still interleave V8
+    // work on this one thread and trip
+    // `heap->isolate() == Isolate::TryGetCurrent()`. The per-connection lock
+    // (`ctx.v8_lock`) keeps each handler contiguous: V8 fully exits one Isolate
+    // before the next of this connection's pages is allowed in. It is
+    // per-connection, not process-wide, so other connections run in parallel.
     //
-    // Holding the process-wide V8 lock around the entire dispatch keeps each
-    // handler contiguous on the thread: V8 fully exits one Isolate before
-    // the next page is allowed in. This converts the abort into latency.
-    // It overshoots — non-V8 handlers (Browser.*, Storage.*, Emulation.*)
-    // also serialize — but those are cheap and the safety win dominates.
-    //
-    // The properly concurrent fix is to pin each `JsRuntime` to its own OS
-    // thread and message-pass; that's tracked as the larger #19 follow-up.
-    //
-    // Optimization: methods that demonstrably never touch V8 bypass the
-    // lock. During Puppeteer's newPage() setup ~8 such calls (Page.enable,
-    // Runtime.enable, Page.getFrameTree, Page.addScriptToEvaluateOnNewDocument,
-    // Page.createIsolatedWorld, etc.) used to serialize behind any
-    // in-flight V8 work on a sibling page. Bypassing keeps the setup chain
-    // running while a separate nav executes. Each listed method was audited
-    // to confirm it never reaches `JsRuntime::execute_script` or DOM
-    // mutation that re-enters V8; `get_session_page_mut` (which can
-    // trigger `suspend_js`/`resume_js`) is NOT in the list.
-    let _v8_guard = if is_v8_free_method(&req.method)
-        || (req.method == "Page.navigate" && obscura_js::v8_lock::nav_unlock_enabled())
-    {
-        // Page.navigate self-manages the lock when OBSCURA_UNLOCK_NAV_FETCH is
-        // on (see Page::navigate_with_wait_post), releasing it across the
-        // primary fetch. The navigate handler passes manage_lock=nav_unlock_enabled()
-        // for exactly this method, so the two agree on ownership — do NOT take
-        // it here for any other method or the navigation runs V8 unguarded.
+    // Optimization: methods that demonstrably never touch V8 bypass the lock
+    // (Puppeteer's newPage() setup issues ~8 such calls). Each listed method was
+    // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
+    // mutation that re-enters V8; `get_session_page_mut` (which can trigger
+    // `suspend_js`/`resume_js`) is NOT in the list.
+    let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
-        Some(obscura_js::v8_lock::global().lock().await)
+        // Per-connection lock (owned guard, so it does not borrow `ctx`): keeps
+        // this connection's own V8 work contiguous on its thread without
+        // serializing other connections (#430).
+        Some(ctx.v8_lock.clone().lock_owned().await)
     };
 
     // Per-command V8 watchdog. The lock above keeps each handler contiguous on
     // the thread, but it does not bound how long a handler runs: a hung page (a
-    // runaway Runtime.evaluate, a synchronous DOM op) would hold the
-    // process-wide V8 lock and wedge every other session forever. The one-shot
+    // runaway Runtime.evaluate, a synchronous DOM op) would hold this
+    // connection's V8 lock and wedge its other sessions forever. The one-shot
     // CLI uses a process-level hard deadline for this; the long-running server
     // cannot force-exit, so we terminate just the offending isolate instead.
     // OBSCURA_CDP_COMMAND_TIMEOUT_MS tunes the bound (0 disables); the default
@@ -357,6 +399,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
+        "IO" => domains::io::handle(method, &req.params, ctx).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,

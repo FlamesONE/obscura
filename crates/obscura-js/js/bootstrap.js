@@ -29,6 +29,7 @@ let __obscura_core = (typeof Deno !== "undefined" && Deno.core) ? Deno.core : nu
     '__obscura_turnstile_hook_installed', '__obscura_turnstile_token',
     '__capturedSitekey', '__capturedAction', '__capturedCdata',
     '__capturedChlPageData', '__capturedTurnstileCallback',
+    '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -113,15 +114,71 @@ const __registerDynamicIframe = (el) => {
 };
 
 const _nativeFns = new Set();
+// Exact toString override for members whose native form is not just
+// `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
+// or functions whose `.name` does not match the real builtin.
+const _nativeStr = new Map();
 const _origToString = Function.prototype.toString;
-Function.prototype.toString = function() {
+Function.prototype.toString = function toString() {
+  if (_nativeStr.has(this)) { return _nativeStr.get(this); }
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
   }
   return _origToString.call(this);
 };
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+// Mark a function with an exact native-code toString (used for accessors).
+function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
 _nativeFns.add(Function.prototype.toString);
+
+// unusualWindowProperties: obscura's internal globals are made non-enumerable
+// (see _preHideInternals and __obscura_init), which hides them from
+// Object.keys / for-in. But fingerprinting scripts enumerate the global object
+// with Object.getOwnPropertyNames and Reflect.ownKeys, which return
+// non-enumerable properties too, so the internals still leak (pixelscan's
+// unusualWindowProperties check). Filter the engine's own globals out of the
+// reflection APIs when they target the global object. The canonical name set is
+// __obscura_hide_list, precomputed at snapshot-build time; referencing it lazily
+// means the list is already populated by the time any page calls these.
+(function _hideInternalsFromReflection() {
+  var _cache = null, _cacheLen = -1;
+  function _set() {
+    var list = globalThis.__obscura_hide_list;
+    if (!list) { return null; }
+    if (_cache && _cacheLen === list.length) { return _cache; }
+    _cache = new Set(list);
+    _cache.add('__obscura_hide_list');
+    _cacheLen = list.length;
+    return _cache;
+  }
+  function _isGlobal(t) { return t === globalThis; }
+  function _filter(t, names) {
+    if (!_isGlobal(t)) { return names; }
+    var set = _set();
+    if (!set) { return names; }
+    var out = [];
+    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    return out;
+  }
+  var _oGOPN = Object.getOwnPropertyNames;
+  var _oOwnKeys = Reflect.ownKeys;
+  var _oKeys = Object.keys;
+  var _oGOPDs = Object.getOwnPropertyDescriptors;
+  function define(obj, prop, impl) {
+    try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  }
+  define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
+  define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
+  define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
+    var all = _oGOPDs(t);
+    if (_isGlobal(t)) {
+      var set = _set();
+      if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    }
+    return all;
+  });
+})();
 
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
@@ -222,6 +279,53 @@ async function __processDynScriptQueue() {
     __dynScriptBusy = false;
   }
 }
+// Resolve a resource URL (script src / link href) against <base href> or the
+// document URL, the way the inline dynamic-script path does. Guarded so a bad
+// base or href never throws into appendChild.
+function _resolveResourceUrl(src) {
+  let baseHref = null;
+  try {
+    const baseEl = globalThis.document?.querySelector('base[href]');
+    baseHref = baseEl ? baseEl.getAttribute('href') : null;
+  } catch(e) { baseHref = null; }
+  const docUrl = globalThis.location?.href || 'http://localhost/';
+  let baseUrl;
+  try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+  catch(e) { baseUrl = docUrl; }
+  try {
+    return src.startsWith('http') || src.startsWith('data:')
+      ? src
+      : new URL(src, baseUrl).href;
+  } catch(e) { return src; }
+}
+
+// A dynamically-inserted <link rel="stylesheet" href> must fetch and fire
+// load/error so frameworks awaiting the link's onload (Promise.all of lazy
+// CSS + JS, antd/bootstrap loaders, etc.) resolve instead of hanging forever.
+// There is no layout engine to apply the CSS, but the load-event contract
+// matches Chrome. Issue #409.
+async function _loadLinkedStylesheet(c) {
+  // obscura does not yet reflect the `rel` IDL attribute back to the content
+  // attribute, so `link.rel = "stylesheet"` leaves getAttribute('rel') null.
+  // Read both so the property-assignment form (the common framework pattern)
+  // and the parsed-from-HTML form are both recognized.
+  const rel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
+  if (!rel.split(/\s+/).includes('stylesheet')) return;
+  const href = c.getAttribute('href');
+  if (!href) return;
+  const fullUrl = _resolveResourceUrl(href);
+  let pageOrigin = "";
+  try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
+  try {
+    // Use the captured op-bridge, not global `Deno` — __obscura_init deletes
+    // globalThis.Deno for stealth, so a direct Deno.core ref throws here.
+    await __obscura_core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+  } catch(e) {
+    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+  }
+}
+
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -441,13 +545,95 @@ class MessageChannel {
 globalThis.MessageChannel = MessageChannel;
 globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
 
+const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+// Standard CSS property names (camelCase). Real CSSStyleDeclaration exposes every
+// property as an enumerable accessor, so feature-detection code (`'gap' in
+// el.style`) and enumeration (`Object.keys(el.style)`) see the whole set, not
+// just the ones that happen to be assigned (issue #356).
+const _CSS_PROPERTY_NAMES = [
+  "accentColor","alignContent","alignItems","alignSelf","all","animation","animationDelay",
+  "animationDirection","animationDuration","animationFillMode","animationIterationCount",
+  "animationName","animationPlayState","animationTimingFunction","appearance","aspectRatio",
+  "backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode",
+  "backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition",
+  "backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","blockSize",
+  "border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle",
+  "borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle",
+  "borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor",
+  "borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth",
+  "borderCollapse","borderColor","borderImage","borderImageOutset","borderImageRepeat",
+  "borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor",
+  "borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth",
+  "borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth",
+  "borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle",
+  "borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle",
+  "borderRightWidth","borderSpacing","borderStyle","borderTop","borderTopColor","borderTopLeftRadius",
+  "borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxShadow",
+  "boxSizing","breakAfter","breakBefore","breakInside","captionSide","caretColor","clear","clip",
+  "clipPath","color","colorScheme","columnCount","columnFill","columnGap","columnRule","columnRuleColor",
+  "columnRuleStyle","columnRuleWidth","columnSpan","columnWidth","columns","contain","container",
+  "containerName","containerType","content","counterIncrement","counterReset","counterSet","cssFloat",
+  "cursor","direction","display","emptyCells","filter","flex","flexBasis","flexDirection","flexFlow",
+  "flexGrow","flexShrink","flexWrap","float","font","fontFamily","fontFeatureSettings","fontKerning",
+  "fontOpticalSizing","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontVariant",
+  "fontVariantCaps","fontVariantLigatures","fontVariantNumeric","fontWeight","gap","grid","gridArea",
+  "gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap",
+  "gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate",
+  "gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphens","imageRendering",
+  "inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd",
+  "insetInlineStart","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing",
+  "lineBreak","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin",
+  "marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd",
+  "marginInlineStart","marginLeft","marginRight","marginTop","mask","maxBlockSize","maxHeight",
+  "maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode",
+  "objectFit","objectPosition","offset","opacity","order","outline","outlineColor","outlineOffset",
+  "outlineStyle","outlineWidth","overflow","overflowAnchor","overflowWrap","overflowX","overflowY",
+  "overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX",
+  "overscrollBehaviorY","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom",
+  "paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop",
+  "pageBreakAfter","pageBreakBefore","pageBreakInside","perspective","perspectiveOrigin","placeContent",
+  "placeItems","placeSelf","pointerEvents","position","quotes","resize","right","rotate","rowGap",
+  "scale","scrollBehavior","scrollMargin","scrollPadding","scrollSnapAlign","scrollSnapStop",
+  "scrollSnapType","tabSize","tableLayout","textAlign","textAlignLast","textCombineUpright",
+  "textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk",
+  "textDecorationStyle","textDecorationThickness","textEmphasis","textIndent","textJustify",
+  "textOrientation","textOverflow","textRendering","textShadow","textTransform","textUnderlineOffset",
+  "textUnderlinePosition","top","touchAction","transform","transformBox","transformOrigin",
+  "transformStyle","transition","transitionDelay","transitionDuration","transitionProperty",
+  "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
+  "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
+];
+const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
+
 class CSSStyleDeclaration {
-  constructor() { this._props = {}; }
-  setProperty(name, value) { this._props[name] = String(value); }
-  removeProperty(name) { const old = this._props[name]; delete this._props[name]; return old || ""; }
-  getPropertyValue(name) { return this._props[name] || ""; }
-  get cssText() { return Object.entries(this._props).map(([k,v]) => `${k}: ${v}`).join("; "); }
-  set cssText(v) { this._props = {}; if(v) v.split(";").forEach(p => { const [k,...rest]=p.split(":"); if(k&&rest.length) this._props[k.trim()]=rest.join(":").trim(); }); }
+  constructor() {
+    // Non-enumerable so it never leaks through the proxy's own-key traps.
+    Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+  }
+  // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
+  // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
+  // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  setProperty(name, value) {
+    const k = _cssCamelToKebab(String(name));
+    if (value === "" || value == null) { delete this._props[k]; return; }
+    this._props[k] = String(value);
+  }
+  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
+  getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
+  getPropertyPriority() { return ""; }
+  get cssText() {
+    const e = Object.entries(this._props);
+    return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+  }
+  set cssText(v) {
+    for (const k in this._props) delete this._props[k];
+    if (v) String(v).split(";").forEach((p) => {
+      const i = p.indexOf(":");
+      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
+    });
+  }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
 }
@@ -455,13 +641,40 @@ class CSSStyleDeclaration {
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
-    if (typeof p === "string") return t._props[p] || "";
-    return undefined;
+    if (/^\d+$/.test(p)) return t.item(+p);
+    return t.getPropertyValue(p);
   },
   set(t, p, v) {
-    if (typeof p === "string") { t._props[p] = String(v); return true; }
-    t[p] = v; return true;
-  }
+    if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "cssText") { t.cssText = v; return true; }
+    if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
+    t.setProperty(p, v);
+    return true;
+  },
+  has(t, p) {
+    if (typeof p !== "string") return Reflect.has(t, p);
+    if (p in Object.getPrototypeOf(t)) return true;
+    if (_cssCamelToKebab(p) in t._props) return true;
+    if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
+    return /^\d+$/.test(p) && +p < t.length;
+  },
+  ownKeys(t) {
+    const keys = [];
+    const n = t.length;
+    for (let i = 0; i < n; i++) keys.push(String(i));
+    const names = new Set(_CSS_PROPERTY_NAMES);
+    for (const k of Object.keys(t._props)) names.add(_cssKebabToCamel(k));
+    for (const name of names) keys.push(name);
+    return keys;
+  },
+  getOwnPropertyDescriptor(t, p) {
+    if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
+    if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+      return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
+    }
+    return undefined;
+  },
 });
 
 class Node {
@@ -543,6 +756,11 @@ class Node {
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
     if (!c) return c;
+    if (c instanceof DocumentFragment) {
+      const children = Array.from(c.childNodes);
+      for (const child of children) this.appendChild(child);
+      return c;
+    }
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
@@ -614,6 +832,9 @@ class Node {
     } else if (c instanceof Element && c.tagName === 'IFRAME') {
       __registerDynamicIframe(c);
     }
+    if (c instanceof Element && c.tagName === 'LINK') {
+      _loadLinkedStylesheet(c);
+    }
     return c;
   }
   removeChild(c) {
@@ -624,6 +845,12 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
+    if (newChild instanceof DocumentFragment) {
+      const children = Array.from(newChild.childNodes);
+      for (const child of children) this.insertBefore(child, oldChild);
+      this.removeChild(oldChild);
+      return oldChild;
+    }
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
@@ -631,6 +858,11 @@ class Node {
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
+    if (n instanceof DocumentFragment) {
+      const children = Array.from(n.childNodes);
+      for (const child of children) this.insertBefore(child, ref);
+      return n;
+    }
     _dom("insert_before", n._nid, ref._nid);
     return n;
   }
@@ -1029,6 +1261,17 @@ function _htmlAttrName(el, n) {
   return n;
 }
 
+// A submit button per the HTML spec: a <button> whose type is submit — the
+// default, including when the type attribute is missing or invalid — or an
+// <input> of type submit/image. Used to validate requestSubmit's submitter.
+function _isSubmitButton(el) {
+  if (!el || typeof el.localName !== "string") return false;
+  const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
+  if (el.localName === "button") return type !== "reset" && type !== "button";
+  if (el.localName === "input") return type === "submit" || type === "image";
+  return false;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1380,10 +1623,17 @@ class Element extends Node {
           return;
         }
       }
-      const type = (this.getAttribute('type') || '').toLowerCase();
-      if (type === 'submit' || (this.localName === 'button' && type !== 'button' && type !== 'reset')) {
+      // Same predicate requestSubmit validates against, so an internal click
+      // can never hand it a submitter it would reject. Also matches the CDP
+      // click path in input.rs, which already treats <input type=image> as a
+      // submit button.
+      if (_isSubmitButton(this)) {
         const form = this.closest ? this.closest('form') : null;
-        if (form && typeof form.submit === 'function') {
+        // A real submit-button click fires the cancelable submit event, so use
+        // requestSubmit() (not the plain submit() method, which now bypasses it).
+        if (form && typeof form.requestSubmit === 'function') {
+          form.requestSubmit(this);
+        } else if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
       }
@@ -1568,8 +1818,20 @@ class Element extends Node {
         const attr = this.getAttribute('value');
         return attr !== null ? attr : 'on';
       }
+      if (itype === 'file') {
+        // Chrome exposes a file input's value as C:\fakepath\<first filename>.
+        return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
+      }
     }
     return this.getAttribute("value") || "";
+  }
+  // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
+  // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
+  // the DOM. See __obscura_setInputFiles (issue #359).
+  get files() {
+    if (this.localName !== 'input') return undefined;
+    if ((this.getAttribute('type') || '').toLowerCase() !== 'file') return null;
+    return this._files || _emptyFileList();
   }
   set value(v) {
     const tag = this.localName;
@@ -1861,10 +2123,37 @@ class Element extends Node {
       opts[i]._selected = (i === v);
     }
   }
+  // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
+  // cancelable `submit` event — a page's submit listener cannot veto it. Only
+  // requestSubmit() and user-initiated submits fire the cancelable event.
+  // Conflating the two broke sites whose submit listener preventDefault()s the
+  // native submit and then calls form.submit() from a callback (e.g. an
+  // invisible-reCAPTCHA data-callback) to actually send the form.
   submit(submitter) {
+    this._navigateSubmit(submitter);
+  }
+  requestSubmit(submitter) {
+    // Per spec, a given submitter must be a submit button owned by this form;
+    // both checks run before the submit event fires. A missing/null submitter
+    // means "submit from the form itself".
+    if (submitter !== undefined && submitter !== null) {
+      if (!_isSubmitButton(submitter)) {
+        throw new TypeError(
+          "Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not a submit button."
+        );
+      }
+      if (submitter.form !== this) {
+        throw new DOMException(
+          "Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not owned by this form element.",
+          'NotFoundError'
+        );
+      }
+    }
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
-
+    this._navigateSubmit(submitter);
+  }
+  _navigateSubmit(submitter) {
     const pairs = [];
     const fields = this.querySelectorAll('input, select, textarea');
     for (let i = 0; i < fields.length; i++) {
@@ -1915,9 +2204,23 @@ class Element extends Node {
   get dataset() {
     if (this._dataset) return this._dataset;
     const el = this;
+    const attrFor = (k) => "data-" + _cssCamelToKebab(k);
+    // camelCase the part after the `data-` prefix, e.g. data-foo-bar -> fooBar.
+    const dataKeys = () => el.getAttributeNames()
+      .filter((n) => n.startsWith("data-"))
+      .map((n) => _cssKebabToCamel(n.slice(5)));
     this._dataset = new Proxy({}, {
-      get(_, k) { if(typeof k!=="string")return undefined; return el.getAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase()); },
-      set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
+      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
+      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
+      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
+      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+      ownKeys() { return dataKeys(); },
+      getOwnPropertyDescriptor(_, k) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
+          return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
+        }
+        return undefined;
+      },
     });
     return this._dataset;
   }
@@ -1935,8 +2238,13 @@ class Element extends Node {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
   }
-  get scrollTop() { return 0; } set scrollTop(v) {}
-  get scrollLeft() { return 0; } set scrollLeft(v) {}
+  // No layout engine, so there is no real overflow to scroll. We still track a
+  // scroll offset so scrollTop/scrollLeft round-trip and the scroll methods
+  // below can report a position, which is what infinite-scroll code reads back.
+  get scrollTop() { return this._scrollTop || 0; }
+  set scrollTop(v) { v = +v; this._scrollTop = Number.isFinite(v) && v > 0 ? v : 0; }
+  get scrollLeft() { return this._scrollLeft || 0; }
+  set scrollLeft(v) { v = +v; this._scrollLeft = Number.isFinite(v) && v > 0 ? v : 0; }
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
     // documentElement and body span the full viewport. Without this every
@@ -1994,6 +2302,31 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
+  // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
+  // Without layout the offset cannot be clamped to a real max, but updating it
+  // and firing a scroll event lets scroll-driven lazy loaders advance instead
+  // of throwing "scrollBy is not a function".
+  scrollTo(x, y) {
+    let left, top;
+    if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
+    else { left = x; top = y; }
+    if (left !== undefined) this.scrollLeft = +left || 0;
+    if (top !== undefined) this.scrollTop = +top || 0;
+    this._fireScroll();
+  }
+  scroll(x, y) { this.scrollTo(x, y); }
+  scrollBy(x, y) {
+    let dl, dt;
+    if (x !== null && typeof x === 'object') { dl = x.left; dt = x.top; }
+    else { dl = x; dt = y; }
+    this.scrollLeft = (this.scrollLeft || 0) + (+dl || 0);
+    this.scrollTop = (this.scrollTop || 0) + (+dt || 0);
+    this._fireScroll();
+  }
+  _fireScroll() {
+    const self = this;
+    setTimeout(() => { try { self.dispatchEvent(new Event('scroll', { bubbles: false })); } catch (e) {} }, 0);
+  }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
     return {
@@ -2422,18 +2755,10 @@ class Document extends Node {
         return true;
       },
       nextNode() {
-        let node = this.currentNode;
-        let child = node.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          if (child.firstChild) { child = child.firstChild; continue; }
-          if (child.nextSibling) { child = child.nextSibling; continue; }
-          let parent = child.parentNode;
-          while (parent && parent !== this.root) {
-            if (parent.nextSibling) { child = parent.nextSibling; break; }
-            parent = parent.parentNode;
-          }
-          if (!parent || parent === this.root) return null;
+        let node = _wrap(+_dom("next_in_subtree", this.root._nid, this.currentNode._nid));
+        while (node) {
+          if (this._accept(node)) { this.currentNode = node; return node; }
+          node = _wrap(+_dom("next_in_subtree", this.root._nid, node._nid));
         }
         return null;
       },
@@ -2942,6 +3267,7 @@ function _buildPdfPluginsAndMimeTypes() {
 }
 
 class NetworkInformation {
+  constructor() { _makeListenerBox(this); }
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
   get effectiveType() { return '4g'; }
@@ -2985,32 +3311,15 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
+// Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
+// hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"; },
-  get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
-  get language() { return globalThis.__obscura_language || "en-US"; },
-  get languages() { return globalThis.__obscura_languages || ["en-US","en"]; },
-  get platform() { return globalThis.__obscura_platform || "Win32"; },
   onLine: true, cookieEnabled: true,
-  get hardwareConcurrency() {
-    var cdp = globalThis.__obscura_hardware_concurrency;
-    if (cdp != null) return cdp;
-    return 8;
-  },
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
-  deviceMemory: 8,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
-  get plugins() {
-    _buildPdfPluginsAndMimeTypes();
-    return _pdfPluginArray;
-  },
-  get mimeTypes() {
-    _buildPdfPluginsAndMimeTypes();
-    return _pdfMimeTypeArray;
-  },
   userAgentData: {
     mobile: false,
     get brands() { return _uaBrands(); },
@@ -3097,26 +3406,62 @@ globalThis.navigator = {
   },
 };
 
-// navigator is a plain object literal above, so its own [[Prototype]] is
-// Object.prototype unless explicitly relinked — real Chrome's navigator has
-// Navigator.prototype in its chain (`navigator instanceof Navigator` and
-// `Object.getPrototypeOf(navigator) === Navigator.prototype` are both true).
-Object.setPrototypeOf(globalThis.navigator, Navigator.prototype);
-
-// navigator.webdriver lives on Navigator.prototype (not the instance) in real
-// Chrome, so Object.getOwnPropertyDescriptor(navigator, 'webdriver') is
-// undefined while Object.getOwnPropertyDescriptor(Navigator.prototype,
-// 'webdriver') has the getter. An earlier version of this patch inserted an
-// intermediate prototype object between navigator and Navigator.prototype to
-// get the same "no own property" result — but that broke
-// `Object.getPrototypeOf(navigator) === Navigator.prototype`, a one-line
-// check several stealth-detection scripts use specifically to catch this
-// exact prototype-chain-splicing trick. Defining the getter directly on
-// Navigator.prototype matches real Chrome's shape with no extra proto layer.
+// Put spoofed navigator props on a thin prototype above Navigator.prototype
+// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
+// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
-  var _wdGetter = function() { return false; };
-  _markNative(_wdGetter);
-  Object.defineProperty(Navigator.prototype, 'webdriver', {get: _wdGetter, set: undefined, enumerable: true, configurable: true});
+  var _navProto = Object.create(Navigator.prototype);
+
+  function defGetter(key, fn) {
+    _markNative(fn);
+    Object.defineProperty(_navProto, key, {
+      get: fn, set: undefined, enumerable: true, configurable: true,
+    });
+  }
+
+  defGetter('webdriver', function() { return false; });
+  defGetter('userAgent', function() {
+    return globalThis.__obscura_ua ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+  });
+  defGetter('appVersion', function() {
+    return (globalThis.__obscura_ua ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
+  });
+  defGetter('platform', function() {
+    return globalThis.__obscura_platform || "Win32";
+  });
+  // CDP Emulation.setLocaleOverride wins over the built-in default; falls back
+  // to en-US when no override was pushed for this page.
+  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('languages', function() { return globalThis.__obscura_languages || ["en-US", "en"]; });
+
+  // Build PDF plugins/mimeTypes with the full cross-referenced shape real
+  // Chrome exposes: each Plugin carries its enabledPlugin-linked MimeType so
+  // `plugins[0][0].enabledPlugin === plugins[0]` and `plugins[0].length > 0`
+  // hold (fingerprint scripts check both). Built lazily on first access (never
+  // eagerly in this IIFE — a throw here would abort the whole bootstrap) and
+  // cached so navigator.plugins === navigator.plugins.
+  defGetter('plugins', function() { _buildPdfPluginsAndMimeTypes(); return _pdfPluginArray; });
+  defGetter('mimeTypes', function() { _buildPdfPluginsAndMimeTypes(); return _pdfMimeTypeArray; });
+
+  // Values set per-page by __obscura_init (avoids own data props on navigator).
+  // A CDP Emulation.setHardwareConcurrencyOverride (__obscura_hardware_concurrency)
+  // takes precedence over the randomized fingerprint value (__obscura_hw).
+  defGetter('hardwareConcurrency', function() {
+    var cdp = globalThis.__obscura_hardware_concurrency;
+    return cdp != null ? cdp : (globalThis.__obscura_hw || 8);
+  });
+  defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
+
+  _navProto.share = _markNative(function share(data) {
+    return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  });
+  _navProto.canShare = _markNative(function canShare() { return false; });
+
+  Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
 globalThis.chrome = {
@@ -4313,7 +4658,28 @@ globalThis.ElementInternals = class ElementInternals {
   get shadowRoot() { return (this._el && this._el._shadowRoot) || null; }
   get states() { return this._states; }
 };
-globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
+// Full standard constant set (issue #439). The partial version here lacked
+// FILTER_ACCEPT/REJECT/SKIP and most SHOW_* values, so the canonical
+// `acceptNode() { return NodeFilter.FILTER_ACCEPT; }` filter idiom returned
+// undefined and TreeWalker/NodeIterator rejected every node.
+globalThis.NodeFilter = {
+  SHOW_ALL: 0xFFFFFFFF,
+  SHOW_ELEMENT: 0x1,
+  SHOW_ATTRIBUTE: 0x2,
+  SHOW_TEXT: 0x4,
+  SHOW_CDATA_SECTION: 0x8,
+  SHOW_ENTITY_REFERENCE: 0x10,
+  SHOW_ENTITY: 0x20,
+  SHOW_PROCESSING_INSTRUCTION: 0x40,
+  SHOW_COMMENT: 0x80,
+  SHOW_DOCUMENT: 0x100,
+  SHOW_DOCUMENT_TYPE: 0x200,
+  SHOW_DOCUMENT_FRAGMENT: 0x400,
+  SHOW_NOTATION: 0x800,
+  FILTER_ACCEPT: 1,
+  FILTER_REJECT: 2,
+  FILTER_SKIP: 3,
+};
 // ResizeObserver is defined earlier with real per-target firing; the stub
 // that previously lived here was a no-op that clobbered the real class.
 //
@@ -4487,6 +4853,40 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
     if (desc && desc.set) { desc.set.call(el, value); return; }
   } catch (_e) {}
   el[field] = value;
+};
+
+// Build a FileList-like object: an array with the DOM's `item(i)` accessor.
+function _makeFileList(files) {
+  const list = files.slice();
+  Object.defineProperty(list, "item", { value: (i) => list[i] || null, enumerable: false });
+  return list;
+}
+function _emptyFileList() { return _makeFileList([]); }
+
+// Populate an <input type=file>'s FileList from the CDP DOM.setFileInputFiles
+// call (Puppeteer uploadFile / Playwright setInputFiles). `specs` is an array of
+// { name, type, b64 } where b64 is the base64-encoded file bytes read on the
+// Rust side. Real File objects (backed by the bytes) are created so page code can
+// read them via FileReader or upload them via fetch/FormData, then input+change
+// fire as a genuine selection would (issue #359).
+globalThis.__obscura_setInputFiles = function(el, specs) {
+  const files = (specs || []).map((s) => {
+    let bytes;
+    try {
+      const bin = atob(s.b64 || "");
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (_e) { bytes = new Uint8Array(0); }
+    return new File([bytes], s.name || "", { type: s.type || "" });
+  });
+  el._files = _makeFileList(files);
+  // Mark the events trusted (isTrusted === true), like the Input domain does
+  // for synthesized clicks/keys. A real <input type=file> selection fires
+  // trusted events; upload flows that gate their change handler on
+  // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
+  // ones, which would silently break the exact case this feature targets.
+  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
+  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
@@ -5066,7 +5466,109 @@ globalThis.Crypto = class Crypto {
   }
 };
 globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
-globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
+// Real structured clone (not JSON). JSON.parse(JSON.stringify) silently drops
+// ArrayBuffer/TypedArray (they serialize to {}), so Cloudflare's turnstile
+// orchestrate loses every byte it tries to round-trip through postMessage and
+// the challenge never completes (issue #389). Clone buffers, typed arrays,
+// maps/sets, dates, errors, and plain objects recursively; CryptoKey and other
+// types that register a clone hook (see crypto.subtle below) are routed there.
+function _structuredClone(value, seen) {
+  // Functions and symbols are not structured-cloneable (HTML structured clone,
+  // DataCloneError). This must run before the primitive early-return below,
+  // which would otherwise pass them through by reference.
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new DOMException("Failed to execute 'structuredClone': value could not be cloned.", "DataCloneError");
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value);
+  // Typed arrays: copy the underlying buffer slice. DataView has no .slice(),
+  // so slice its buffer over the view's range and wrap a fresh view.
+  if (ArrayBuffer.isView(value)) {
+    if (value instanceof DataView) {
+      const buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      const copy = new DataView(buf);
+      seen.set(value, copy);
+      return copy;
+    }
+    const Ctor = value.constructor;
+    const copy = new Ctor(value.slice());
+    seen.set(value, copy);
+    return copy;
+  }
+  if (value instanceof ArrayBuffer) {
+    const copy = value.slice(0);
+    seen.set(value, copy);
+    return copy;
+  }
+  if (value instanceof SharedArrayBuffer) {
+    return value; // transferable, not copyable
+  }
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof Map) {
+    const m = new Map();
+    seen.set(value, m);
+    for (const [k, v] of value) m.set(_structuredClone(k, seen), _structuredClone(v, seen));
+    return m;
+  }
+  if (value instanceof Set) {
+    const s = new Set();
+    seen.set(value, s);
+    for (const v of value) s.add(_structuredClone(v, seen));
+    return s;
+  }
+  if (value instanceof Error) {
+    const Ctor = value.constructor || Error;
+    const e = new Ctor(value.message);
+    // Record the clone before recursing into `cause`, otherwise a cycle
+    // through the error (e.cause === e) recurses until the stack overflows.
+    seen.set(value, e);
+    if (value.name) e.name = value.name;
+    if (value.stack) e.stack = value.stack;
+    if (value.cause !== undefined) e.cause = _structuredClone(value.cause, seen);
+    return e;
+  }
+  // Platform objects that carry internal slots opt into cloning via a hook
+  // (CryptoKey re-registers its key material so the clone stays usable by
+  // crypto.subtle). Anything else with a registered hook takes that path.
+  if (typeof value[Symbol.toStringTag] === "string" && globalThis.__obscura_clone_hooks) {
+    const hook = globalThis.__obscura_clone_hooks[value[Symbol.toStringTag]];
+    if (typeof hook === "function") return hook(value, seen);
+  }
+  // Plain objects clone onto Object.prototype (like Chrome), not the source's
+  // prototype. Define each property instead of assigning it: a source with an
+  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":…}')
+  // yields) would otherwise hit the inherited __proto__ setter and reparent
+  // the clone instead of copying the property.
+  const out = Array.isArray(value) ? [] : {};
+  seen.set(value, out);
+  for (const k in value) {
+    if (Object.prototype.hasOwnProperty.call(value, k)) {
+      const cloned = _structuredClone(value[k], seen);
+      // Only `__proto__` needs defineProperty: plain assignment would hit the
+      // inherited prototype setter and reparent the clone instead of adding an
+      // own data property. Every other key takes the fast assignment path.
+      if (k === "__proto__") {
+        Object.defineProperty(out, k, {
+          value: cloned,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      } else {
+        out[k] = cloned;
+      }
+    }
+  }
+  // Symbols are not enumerable via for-in; copy own symbol-keyed properties.
+  const syms = Object.getOwnPropertySymbols(value);
+  for (const s of syms) {
+    const d = Object.getOwnPropertyDescriptor(value, s);
+    if (d && "value" in d) out[s] = _structuredClone(d.value, seen);
+  }
+  return out;
+}
+globalThis.structuredClone = globalThis.structuredClone || ((v) => _structuredClone(v, new Map()));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
@@ -5667,6 +6169,7 @@ _markNative(globalThis.Selection);
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.insertAdjacentText,
   Element.prototype.insertAdjacentElement, Element.prototype.scrollIntoView,
+  Element.prototype.scrollTo, Element.prototype.scrollBy, Element.prototype.scroll,
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,
@@ -6669,8 +7172,6 @@ navigator.keyboard = {
 };
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
-navigator.share = function(data) { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
-navigator.canShare = function() { return false; };
 
 globalThis.opener = null;
 
@@ -6924,6 +7425,22 @@ if (!globalThis.crypto.subtle) {
     }
     return keyMaterial.get(key);
   }
+  // A CryptoKey cloned via structuredClone or postMessage is a different
+  // object, so the WeakMap lookup above misses and crypto.subtle throws
+  // "Argument is not a valid CryptoKey". Re-register the (cloned) key's
+  // material so the clone stays usable. The clone hook is dispatched by
+  // _structuredClone via Symbol.toStringTag ("CryptoKey"); registered lazily
+  // because structuredClone is defined before this block (issue #389).
+  globalThis.__obscura_clone_hooks = globalThis.__obscura_clone_hooks || {};
+  // `seen` is the clone memo _structuredClone hands every hook. Populate it so
+  // one key reached twice in a graph clones to one shared object (and its key
+  // material is registered once), matching structuredClone's identity rules.
+  globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
+    if (seen && seen.has(src)) return seen.get(src);
+    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    if (seen) seen.set(src, copy);
+    return copy;
+  };
 
   const toBytes = (data) => {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -7224,21 +7741,28 @@ if (typeof Image === 'undefined') {
     // `.src` flips `complete` and fires `load` on a microtask-later tick. Lazy
     // loaders and preloaders that create `new Image()`, set `.src`, and wait for
     // `onload` (or addEventListener('load')) would hang forever otherwise.
-    Object.defineProperty(img, 'src', {
-      configurable: true, enumerable: true,
-      get() { return _imgSrcDesc.get.call(img); },
-      set(v) {
-        _imgSrcDesc.set.call(img, v);
-        if (!img.getAttribute('src')) return;
-        img.complete = false;
-        setTimeout(function () {
-          img.complete = true;
-          img.naturalWidth = img.naturalWidth || img.width || 0;
-          img.naturalHeight = img.naturalHeight || img.height || 0;
-          try { img.dispatchEvent(new Event('load')); } catch (e) {}
-        }, 0);
-      },
-    });
+    // Anti-bot scripts (Booking.com, issue #394) pre-define a non-configurable
+    // own `src` on <img> elements; redefining it throws "Cannot redefine
+    // property: src" and kills the constructor. Skip the load emulation then:
+    // a page that owns `src` is instrumenting loads itself.
+    const ownSrc = Object.getOwnPropertyDescriptor(img, 'src');
+    if (!ownSrc || ownSrc.configurable) {
+      Object.defineProperty(img, 'src', {
+        configurable: true, enumerable: true,
+        get() { return _imgSrcDesc.get.call(img); },
+        set(v) {
+          _imgSrcDesc.set.call(img, v);
+          if (!img.getAttribute('src')) return;
+          img.complete = false;
+          setTimeout(function () {
+            img.complete = true;
+            img.naturalWidth = img.naturalWidth || img.width || 0;
+            img.naturalHeight = img.naturalHeight || img.height || 0;
+            try { img.dispatchEvent(new Event('load')); } catch (e) {}
+          }, 0);
+        },
+      });
+    }
     return img;
   };
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
@@ -7454,11 +7978,6 @@ if (typeof Selection === 'undefined') {
   };
 }
 
-if (typeof NodeFilter === 'undefined') {
-  globalThis.NodeFilter = { SHOW_ALL:0xFFFFFFFF, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128,
-    FILTER_ACCEPT:1, FILTER_REJECT:2, FILTER_SKIP:3 };
-}
-
 if (typeof TreeWalker === 'undefined') {
   globalThis.TreeWalker = class TreeWalker {
     constructor(root){this.root=root;this.currentNode=root;this.whatToShow=0xFFFFFFFF;this.filter=null;}
@@ -7532,6 +8051,29 @@ if (typeof URLPattern === 'undefined') {
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+}
+
+// Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
+// nodes between documents (portals, iframe hand-off) call it; the missing
+// method throws "adoptNode is not a function". With no second document to
+// transfer ownership from, the node is already ours, so return it as-is,
+// matching the observable effect of adoption into this document.
+if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
+  Document.prototype.adoptNode = function(node) { return node || null; };
+}
+
+// Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
+// it; the missing method throws. Spec semantics: no force arg toggles, force
+// true adds, force false removes; returns the new presence.
+if (typeof Element !== 'undefined' && !Element.prototype.toggleAttribute) {
+  Element.prototype.toggleAttribute = function(name, force) {
+    const n = String(name);
+    const present = this.hasAttribute(n);
+    const want = arguments.length < 2 ? !present : !!force;
+    if (want && !present) { this.setAttribute(n, ''); return true; }
+    if (!want && present) { this.removeAttribute(n); return false; }
+    return want;
+  };
 }
 
 // Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
@@ -7711,11 +8253,9 @@ globalThis.__obscura_init = function() {
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  if (globalThis.__obscura_hardware_concurrency == null) {
-    globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  }
+  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
@@ -7749,7 +8289,11 @@ globalThis.__obscura_init = function() {
 // globals defined by bootstrap that we want to hide and stashes them
 // for __obscura_init to consume on every subsequent page. The snapshot
 // preserves the array as a regular global.
-globalThis.__obscura_hide_list = Object.keys(globalThis).filter(k =>
+// Use getOwnPropertyNames, not Object.keys: the internal globals declared by
+// _preHideInternals are already non-enumerable, so Object.keys would omit them
+// and leave them out of the hide list (and thus visible to the reflection-API
+// filter and to fingerprinting scripts). getOwnPropertyNames captures them.
+globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
 );
 
@@ -8218,73 +8762,55 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
 
-// Bulk native-toString spoofing pass. Sites (Cloudflare's challenge JS
-// included) commonly fingerprint automation by calling
-// Function.prototype.toString on well-known globals and checking for
-// "[native code]" — every JS-implemented stub above needs to be in
-// _nativeFns or that check (and anything branching on it) sees our real
-// source instead. Listed here in bulk rather than at each definition site
-// since misses are easy and the cost of over-marking a name that turns out
-// not to exist is zero (the typeof guard skips it).
+// tamperedFunctions: obscura reimplements much of the DOM/Web platform in JS.
+// Real Chrome reports "[native code]" from toString() for every builtin method,
+// accessor, and constructor; any JS-backed member that leaks its source is a
+// detection tell (pixelscan's tamperedFunctions check flags e.g.
+// Element.prototype.nodeType, whose getter returned "get nodeType() {...}").
+// Individual _markNative calls throughout this file cover methods but miss the
+// property accessors and several constructors. Sweep every builtin constructor
+// reachable from the global object and mark its prototype members (methods and
+// accessors) plus the constructor itself native. This runs once at snapshot
+// build time, so it costs nothing per page, and genuinely-native V8 builtins
+// already report native, so only the JS-backed members are affected.
+(function _markBuiltinsNative() {
+  var seen = new Set();
+  function walk(ctor) {
+    if (typeof ctor !== 'function') { return; }
+    _markNative(ctor);
+    var proto = ctor.prototype;
+    if (!proto || seen.has(proto)) { return; }
+    seen.add(proto);
+    var keys = Object.getOwnPropertyNames(proto);
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var d;
+      try { d = Object.getOwnPropertyDescriptor(proto, key); } catch (e) { continue; }
+      if (!d) { continue; }
+      if (typeof d.value === 'function') { _markNative(d.value); }
+      if (typeof d.get === 'function') { _markNativeAs(d.get, 'function get ' + key + '() { [native code] }'); }
+      if (typeof d.set === 'function') { _markNativeAs(d.set, 'function set ' + key + '() { [native code] }'); }
+    }
+  }
+  var names = Object.getOwnPropertyNames(globalThis);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (!/^[A-Z]/.test(name)) { continue; }
+    var val;
+    try { val = globalThis[name]; } catch (e) { continue; }
+    if (typeof val === 'function') { walk(val); }
+  }
+})();
+
+// _markBuiltinsNative only sweeps Capitalized constructors. These lowercase
+// global functions are JS-shimmed above (fetch/timers/getComputedStyle) and
+// would still leak their JS source through Function.prototype.toString — the
+// exact surface Cloudflare's challenge JS fingerprints. Mark them native too.
 [
   'fetch', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
   'requestAnimationFrame', 'cancelAnimationFrame', 'queueMicrotask',
-  'addEventListener', 'removeEventListener', 'dispatchEvent',
-  'Worker', 'WebSocket', 'Notification', 'ResizeObserver',
-  'MutationObserver', 'IntersectionObserver', 'PerformanceObserver',
-  'MessageChannel', 'MessagePort', 'WebGLRenderingContext',
-  'WebGL2RenderingContext', 'CSSStyleSheet', 'ShadowRoot',
-  'CustomElementRegistry', 'ElementInternals', 'DOMException',
-  'getComputedStyle', 'getSelection',
-  // Full DOM/Web-API class hierarchy — an earlier pass only covered ~20
-  // hand-picked names; an audit of every `globalThis.X = class/function`
-  // assignment in this file found ~184 more still exposing real JS source
-  // through Function.prototype.toString, including the entire Node/
-  // Element/HTMLElement/Event class tree. Any class-identity or
-  // constructor-toString check (a standard anti-tamper pattern, not just
-  // on bare functions) would see through every one of these.
-  'AnimationEvent', 'Attr', 'Audio', 'AudioBuffer', 'Blob', 'BroadcastChannel',
-  'CDATASection', 'CanvasRenderingContext2D', 'CharacterData', 'ClipboardEvent',
-  'Comment', 'CompositionEvent', 'ContentIndex', 'Crypto', 'CryptoKey',
-  'CustomEvent', 'DOMMatrix', 'DOMParser', 'DOMPoint', 'DOMRect', 'DOMRectList',
-  'DOMTokenList', 'Document', 'DocumentFragment', 'DocumentType', 'Element',
-  'ErrorEvent', 'EventSource', 'EventTarget', 'File', 'FileReader',
-  'FocusEvent', 'FontFace', 'FontFaceSet', 'FormData', 'HTMLAnchorElement',
-  'HTMLAudioElement', 'HTMLBRElement', 'HTMLBodyElement', 'HTMLButtonElement',
-  'HTMLCanvasElement', 'HTMLCollection', 'HTMLDataListElement',
-  'HTMLDetailsElement', 'HTMLDialogElement', 'HTMLDivElement', 'HTMLElement',
-  'HTMLFieldSetElement', 'HTMLFormElement', 'HTMLHRElement', 'HTMLHeadElement',
-  'HTMLHeadingElement', 'HTMLHtmlElement', 'HTMLIFrameElement',
-  'HTMLImageElement', 'HTMLInputElement', 'HTMLLIElement', 'HTMLLabelElement',
-  'HTMLLegendElement', 'HTMLLinkElement', 'HTMLMediaElement', 'HTMLMetaElement',
-  'HTMLOListElement', 'HTMLOptionElement', 'HTMLParagraphElement',
-  'HTMLPreElement', 'HTMLProgressElement', 'HTMLScriptElement',
-  'HTMLSelectElement', 'HTMLSlotElement', 'HTMLSpanElement', 'HTMLStyleElement',
-  'HTMLTableElement', 'HTMLTemplateElement', 'HTMLTextAreaElement',
-  'HTMLUListElement', 'HTMLUnknownElement', 'HTMLVideoElement',
-  'HashChangeEvent', 'Headers', 'Image', 'ImageBitmap', 'ImageData',
-  'InputEvent', 'KeyboardEvent', 'MediaQueryList', 'MessageEvent', 'MouseEvent',
-  'Node', 'OffscreenCanvas', 'Path2D', 'PointerEvent', 'PopStateEvent',
-  'ProcessingInstruction', 'ProgressEvent', 'Range', 'ReadableStream',
-  'Request', 'Response', 'SVGElement', 'SVGSVGElement', 'Screen',
-  'ServiceWorkerContainer', 'SharedWorker', 'StaticRange', 'Storage',
-  'SubmitEvent', 'SubtleCrypto', 'Text', 'TextDecoder', 'TextEncoder',
-  'TransformStream', 'TransitionEvent', 'TreeWalker', 'UIEvent', 'URL',
-  'URLPattern', 'URLSearchParams', 'ValidityState', 'WheelEvent',
-  'WritableStream', 'XMLDocument', 'XMLSerializer', 'createImageBitmap',
-].forEach(name => {
-  const v = globalThis[name];
-  if (typeof v === 'function') _markNative(v);
-});
-[
-  [globalThis.Worker && globalThis.Worker.prototype, ['postMessage', 'terminate', 'addEventListener', 'removeEventListener']],
-  [globalThis.MessagePort && globalThis.MessagePort.prototype, ['postMessage', 'close', 'addEventListener', 'removeEventListener']],
-  [globalThis.ResizeObserver && globalThis.ResizeObserver.prototype, ['observe', 'unobserve', 'disconnect']],
-  [globalThis.MutationObserver && globalThis.MutationObserver.prototype, ['observe', 'disconnect', 'takeRecords']],
-  [globalThis.IntersectionObserver && globalThis.IntersectionObserver.prototype, ['observe', 'unobserve', 'disconnect', 'takeRecords']],
-].forEach(([proto, methods]) => {
-  if (!proto) return;
-  for (const m of methods) {
-    if (typeof proto[m] === 'function') _markNative(proto[m]);
-  }
+  'addEventListener', 'removeEventListener', 'dispatchEvent', 'getComputedStyle',
+].forEach(function(name) {
+  var v = globalThis[name];
+  if (typeof v === 'function') { _markNative(v); }
 });

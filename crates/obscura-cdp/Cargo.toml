@@ -3,6 +3,13 @@ name = "obscura-cdp"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Forwards obscura-browser's stealth path so CDP handlers that touch
+# Page::stealth_client (e.g. Network.setExtraHTTPHeaders → wreq client) are
+# compiled in. Without this the stealth branches are cfg'd out and silently
+# dropped.
+stealth = ["obscura-browser/stealth"]
+
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-browser = { workspace = true }
@@ -20,6 +27,9 @@ futures-util = "0.3"
 obscura-net = { workspace = true }
 obscura-render = { workspace = true }
 base64 = { workspace = true }
+
+[target.'cfg(target_env = "gnu")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }

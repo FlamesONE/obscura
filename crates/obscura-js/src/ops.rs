@@ -8,7 +8,7 @@ use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
+use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
@@ -53,6 +53,24 @@ pub struct FrameSnapshot {
     pub same_origin: bool,
 }
 
+/// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
+/// so the CDP layer can emit Network.requestWillBeSent / responseReceived for
+/// it. Static navigation subresources go through Page::record_network_event;
+/// this is the parallel channel for script-initiated requests, which run in the
+/// V8 op layer and would otherwise never surface as CDP Network events (#406).
+#[derive(Debug, Clone)]
+pub struct JsNetworkEvent {
+    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Network.getResponseBody resolves for the same request.
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    pub status: u16,
+    pub response_headers: HashMap<String, String>,
+    pub body_size: usize,
+    pub timestamp: f64,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -64,6 +82,10 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
+    /// The owning page's passive on_request/on_response callbacks (issue
+    /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
+    /// the page that registered it.
+    pub callbacks: Option<Arc<CallbackRegistry>>,
     /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
@@ -91,6 +113,10 @@ pub struct ObscuraState {
     // just static DOM attributes, are listed (issue #301).
     pub fetched_urls: Vec<String>,
     pub frame_snapshots: HashMap<String, FrameSnapshot>,
+    // Network events for script-initiated requests (fetch/XHR/dynamic resource),
+    // drained by the Page into its network_events so the CDP layer emits
+    // Network.requestWillBeSent / responseReceived for them (issue #406).
+    pub js_network_events: Vec<JsNetworkEvent>,
 }
 
 impl ObscuraState {
@@ -103,6 +129,7 @@ impl ObscuraState {
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
+            callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
@@ -116,6 +143,7 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             frame_snapshots: HashMap::new(),
+            js_network_events: Vec::new(),
         }
     }
 }
@@ -255,6 +283,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 "last_child" => n.last_child, "next_sibling" => n.next_sibling,
                 "prev_sibling" => n.prev_sibling, _ => None,
             }).flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
+        }
+        "next_in_subtree" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let current = NodeId::new(arg2.parse::<u32>().unwrap_or(0));
+            dom.next_in_subtree(root, current)
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
         }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -642,7 +677,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, http_client) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -674,7 +709,7 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, proxy_url, gs.http_client.clone())
+        (jar, in_flight, itx, proxy_url, gs.callbacks.clone())
     };
 
     // Slots the interception channel can override via Continue so a consumer
@@ -782,9 +817,8 @@ async fn op_fetch_url(
     // reaches the network (Fulfill/Fail from the interception channel short-
     // circuit earlier). on_request/on_response previously fired only for
     // navigation; this wires them for JS fetch()/XHR too.
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_request.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_request_callbacks().await {
             if let Ok(parsed) = url::Url::parse(&url) {
                 let info = RequestInfo {
                     url: parsed,
@@ -792,9 +826,7 @@ async fn op_fetch_url(
                     headers: custom_headers.clone(),
                     resource_type: ResourceType::Fetch,
                 };
-                for cb in cbs.iter() {
-                    cb(&info);
-                }
+                cbs.fire_request(&info).await;
             }
         }
     }
@@ -822,7 +854,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
-                http_client.clone(),
+                callbacks.clone(),
             )
             .await;
         }
@@ -1028,9 +1060,8 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_response.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
             let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
             let info = RequestInfo {
                 url: resp.url.clone(),
@@ -1038,9 +1069,7 @@ async fn op_fetch_url(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for cb in cbs.iter() {
-                cb(&info, &resp);
-            }
+            cbs.fire_response(&info, &resp).await;
         }
     }
     let response_request_id = {
@@ -1065,6 +1094,28 @@ async fn op_fetch_url(
                     gs.network_response_bodies.remove(&oldest);
                 }
             }
+        }
+        // Record a network event so the CDP layer emits requestWillBeSent /
+        // responseReceived for this script-initiated request (#406). Keyed by
+        // the same fetch-{N} id as the stored body so Network.getResponseBody
+        // resolves. Capped to keep a long-lived page from growing unbounded.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        gs.js_network_events.push(JsNetworkEvent {
+            request_id: request_id.clone(),
+            url: url.clone(),
+            method: method.clone(),
+            status,
+            response_headers: resp_headers.clone(),
+            body_size: resp_bytes.len(),
+            timestamp,
+        });
+        const MAX_JS_NETWORK_EVENTS: usize = 4096;
+        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+            gs.js_network_events.drain(0..overflow);
         }
         request_id
     };
@@ -1111,7 +1162,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
-    http_client: Option<Arc<ObscuraHttpClient>>,
+    callbacks: Option<Arc<CallbackRegistry>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -1199,9 +1250,8 @@ async fn stealth_fetch_all(
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_response.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
             let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
             let info = RequestInfo {
                 url: resp.url.clone(),
@@ -1209,9 +1259,7 @@ async fn stealth_fetch_all(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for cb in cbs.iter() {
-                cb(&info, &resp);
-            }
+            cbs.fire_response(&info, &resp).await;
         }
     }
 

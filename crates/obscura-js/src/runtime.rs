@@ -14,6 +14,18 @@ use crate::ops::{build_extension, FrameSnapshot, ObscuraState, StoredNetworkResp
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// Serializes V8 isolate construction across OS threads. The thread-per-
+/// connection server (issue #430) builds isolates on many threads. The main
+/// thread already warms up V8 once before any connection thread starts (see the
+/// `ObscuraJsRuntime::new` warmup in `obscura-cdp` server startup), which is
+/// what actually prevents the `InitializeBuiltinJSDispatchTable` segfault of a
+/// first isolate built off the main thread. This lock is defense-in-depth: it
+/// keeps two connections from running V8's isolate setup concurrently in case
+/// any residual first-time process init races. Construction is rare and fast, so
+/// serializing it costs nothing measurable; isolate *execution* stays fully
+/// parallel, each isolate on its own thread with no shared lock.
+static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -46,7 +58,7 @@ pub struct WatchdogToken {
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
-/// hung page cannot hold the process-wide V8 lock forever. Pair with
+/// hung page cannot hold this connection's V8 lock forever. Pair with
 /// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
 pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
@@ -132,23 +144,32 @@ impl ObscuraJsRuntime {
             stealth,
         ));
 
-        let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![build_extension()],
-            module_loader: Some(module_loader),
-            startup_snapshot: Some(SNAPSHOT),
-            ..Default::default()
-        });
+        // Build the isolate under the process-wide creation lock so two
+        // connection threads never construct isolates concurrently (#430).
+        let (runtime, isolate_handle) = {
+            let _create_guard = ISOLATE_CREATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        runtime.op_state().borrow_mut().put(state_clone);
+            let mut runtime = JsRuntime::new(RuntimeOptions {
+                extensions: vec![build_extension()],
+                module_loader: Some(module_loader),
+                startup_snapshot: Some(SNAPSHOT),
+                ..Default::default()
+            });
 
-        runtime
-            .execute_script(
-                "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
-            )
-            .expect("init should not fail");
+            runtime.op_state().borrow_mut().put(state_clone);
 
-        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            runtime
+                .execute_script(
+                    "<obscura:init>",
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                )
+                .expect("init should not fail");
+
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            (runtime, isolate_handle)
+        };
 
         ObscuraJsRuntime {
             runtime,
@@ -165,6 +186,12 @@ impl ObscuraJsRuntime {
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
+    }
+
+    /// Install the owning page's passive on_request/on_response callback
+    /// registry so scripted fetch()/XHR observation is page-scoped (issue #408).
+    pub fn set_callbacks(&self, callbacks: std::sync::Arc<obscura_net::CallbackRegistry>) {
+        self.state.borrow_mut().callbacks = Some(callbacks);
     }
 
     /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed
@@ -707,9 +734,12 @@ impl ObscuraJsRuntime {
         // Fetch the module source. The old impl registered an empty string
         // and called it loaded, so every Vite / Next module bundle "loaded"
         // in 1ms with zero code and the SPA never mounted (issue #205).
-        let client = self.state.borrow().http_client.clone();
+        let (client, callbacks) = {
+            let st = self.state.borrow();
+            (st.http_client.clone(), st.callbacks.clone())
+        };
         let source_code = match client {
-            Some(c) => match c.fetch(&specifier).await {
+            Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
                 Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
                 Err(e) => {
                     tracing::warn!("Module fetch failed ({}): {}", url, e);
@@ -739,28 +769,47 @@ impl ObscuraJsRuntime {
             }
         };
 
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for the loop to go fully idle: a page timer (setInterval) keeps the
+        // loop busy forever and would otherwise burn the whole budget (#374).
+        self.drive_module_eval(module_id, budget_ms, &format!("Module {}", url))
+            .await;
+        Ok(())
+    }
+
+    /// Drive a just-started module evaluation to completion, or up to
+    /// `budget_ms`. Returns as soon as the module finishes rather than waiting
+    /// for the event loop to go idle: a page timer (setInterval) keeps the loop
+    /// busy forever and would otherwise burn the whole budget, abandoning a
+    /// module that had already evaluated (issue #374).
+    ///
+    /// A module eval error or a timeout is logged under `what` and swallowed:
+    /// neither is fatal to rendering the rest of the page. An event-loop error
+    /// is propagated out of the select and handled the same way -- it must not
+    /// be discarded, or a module stalled on a top-level await spins here for the
+    /// whole budget with nothing logged.
+    async fn drive_module_eval(&mut self, module_id: deno_core::ModuleId, budget_ms: u64, what: &str) {
+        let budget = tokio::time::Duration::from_millis(budget_ms);
         let result = self.runtime.mod_evaluate(module_id);
+        tokio::pin!(result);
 
-        let timeout = tokio::time::timeout(
-            budget,
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
+        let outcome = tokio::time::timeout(budget, async {
+            let event_loop = self
+                .runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default());
+            tokio::pin!(event_loop);
+            tokio::select! {
+                biased;
+                r = &mut result => r,
+                e = &mut event_loop => { e?; (&mut result).await }
+            }
+        })
+        .await;
 
-        match timeout {
+        match outcome {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Module eval error: {}", e);
-                Ok(())
-            }
+            Ok(Err(e)) => tracing::warn!("{} eval error: {}", what, e),
+            Err(_) => tracing::warn!("{} evaluation timed out after {}ms", what, budget_ms),
         }
     }
 
@@ -788,29 +837,13 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let result = self.runtime.mod_evaluate(module_id);
-
-        let timeout = tokio::time::timeout(
-            budget,
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
-
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Inline module timed out after {}ms", budget_ms);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Inline module eval error: {}", e);
-                Ok(())
-            }
-        }
+        // Return as soon as the module finishes evaluating rather than waiting
+        // for idle: Vite's HMR / React-Refresh client installs a setInterval that
+        // keeps the loop busy forever, and waiting for idle burned the whole
+        // budget on this preamble module and starved the module that mounts the
+        // app, leaving #root empty (issue #374).
+        self.drive_module_eval(module_id, budget_ms, "Inline module").await;
+        Ok(())
     }
 
     pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
@@ -1044,6 +1077,13 @@ impl ObscuraJsRuntime {
     /// (issue #301). Backs `--dump assets`.
     pub fn fetched_urls(&self) -> Vec<String> {
         self.state.borrow().fetched_urls.clone()
+    }
+
+    /// Drain the network events recorded for script-initiated requests
+    /// (fetch/XHR/dynamic resource). The Page moves these into its own
+    /// network_events so the CDP layer emits Network events for them (#406).
+    pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
+        std::mem::take(&mut self.state.borrow_mut().js_network_events)
     }
 
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
@@ -1414,6 +1454,112 @@ mod tests {
     }
 
     #[test]
+    fn append_child_flattens_document_fragment() {
+        let mut rt = setup_runtime(r#"<main id="host"></main>"#);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                first.className = second.className = 'quote';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.appendChild(fragment);
+                return [
+                    returned === fragment,
+                    Array.from(host.children).map(node => node.id),
+                    host.querySelectorAll('.quote').length,
+                    fragment.childNodes.length,
+                    first.parentNode === host,
+                    first.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second"], 2, 0, true, true])
+        );
+    }
+
+    #[test]
+    fn insert_before_flattens_document_fragment_in_order() {
+        let mut rt = setup_runtime(r#"<main id="host"><article id="last"></article></main>"#);
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const last = document.getElementById('last');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.insertBefore(fragment, last);
+                return [
+                    returned === fragment,
+                    Array.from(host.children).map(node => node.id),
+                    fragment.childNodes.length,
+                    first.parentElement === host,
+                    second.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second", "last"], 0, true, true])
+        );
+    }
+
+    #[test]
+    fn replace_child_flattens_document_fragment_and_removes_old_child() {
+        let mut rt = setup_runtime(
+            r#"<main id="host"><article id="old"></article><article id="tail"></article></main>"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const old = document.getElementById('old');
+                const fragment = document.createDocumentFragment();
+                const first = document.createElement('article');
+                const second = document.createElement('article');
+                first.id = 'first';
+                second.id = 'second';
+                fragment.appendChild(first);
+                fragment.appendChild(second);
+
+                const returned = host.replaceChild(fragment, old);
+                return [
+                    returned === old,
+                    Array.from(host.children).map(node => node.id),
+                    fragment.childNodes.length,
+                    old.parentNode === null,
+                    first.parentElement === host,
+                    second.parentElement === host,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["first", "second", "tail"], 0, true, true, true])
+        );
+    }
+
+    #[test]
     fn test_inner_html() {
         let mut rt = setup_runtime(r#"<div id="x"><p>Hello</p></div>"#);
         let html = rt.evaluate("document.getElementById('x').innerHTML").unwrap();
@@ -1466,6 +1612,66 @@ mod tests {
             .evaluate("document.querySelector('#hit').textContent")
             .unwrap();
         assert_eq!(text, serde_json::json!("BODY_TEXT"));
+    }
+
+    /// Regression test for #355: an explicit `throw` in one inline <script> must
+    /// not stop later independent <script>s from running. Each <script> executes
+    /// as its own `execute_script` call, mirroring how page.rs runs them, so a
+    /// thrown error is reported but the next script still runs.
+    #[test]
+    fn thrown_error_in_one_script_does_not_stop_later_scripts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("s1", "globalThis.__ran1 = true;").unwrap();
+        let err = rt
+            .execute_script("s2", "throw new Error('only one instance of babel-polyfill is allowed');")
+            .unwrap_err();
+        assert!(err.contains("babel-polyfill"), "expected the thrown message, got: {}", err);
+        rt.execute_script("s3", "globalThis.__ran3 = true;").unwrap();
+        let ran = rt
+            .evaluate("JSON.stringify([globalThis.__ran1 === true, globalThis.__ran3 === true])")
+            .unwrap();
+        assert_eq!(ran, serde_json::json!("[true,true]"));
+    }
+
+    /// Regression test for #356: the `in` operator and `Object.keys` must work on
+    /// `el.style` (CSSStyleDeclaration) and `el.dataset` (DOMStringMap), `_props`
+    /// must not leak, and cssText must serialize dashed names with a trailing
+    /// semicolon.
+    #[test]
+    fn style_and_dataset_support_in_operator_and_keys() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const el = document.createElement('div');
+                    el.style.color = 'red';
+                    el.style.fontSize = '14px';
+                    el.dataset.foo = 'bar';
+                    const keys = Object.keys(el.style);
+                    return JSON.stringify({
+                        colorInStyle: 'color' in el.style,
+                        objectFitInStyle: 'object-fit' in el.style,
+                        keysHasSet: keys.includes('color') && keys.includes('fontSize'),
+                        noPropsLeak: !keys.includes('_props'),
+                        fooInDataset: 'foo' in el.dataset,
+                        datasetKeys: Object.keys(el.dataset),
+                        cssText: el.style.cssText,
+                        length: el.style.length,
+                        getByDash: el.style.getPropertyValue('font-size')
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let p: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(p["colorInStyle"], true);
+        assert_eq!(p["objectFitInStyle"], true);
+        assert_eq!(p["keysHasSet"], true);
+        assert_eq!(p["noPropsLeak"], true);
+        assert_eq!(p["fooInDataset"], true);
+        assert_eq!(p["datasetKeys"], serde_json::json!(["foo"]));
+        assert_eq!(p["cssText"], "color: red; font-size: 14px;");
+        assert_eq!(p["length"], 2);
+        assert_eq!(p["getByDash"], "14px");
     }
 
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
@@ -2559,14 +2765,35 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
+                const connection = navigator.connection;
+                let calls = 0;
+                let receiverMatches = false;
+                function listener(event) {
+                    calls += 1;
+                    receiverMatches = this === connection && event.type === 'change';
+                }
+                connection.addEventListener('change', listener);
+                const dispatchResult = connection.dispatchEvent(new Event('change'));
+                connection.removeEventListener('change', listener);
+                connection.dispatchEvent(new Event('change'));
                 return [
-                    typeof navigator.connection.addEventListener,
+                    typeof connection.addEventListener,
+                    typeof connection.removeEventListener,
+                    typeof connection.dispatchEvent,
                     typeof navigator.serviceWorker.addEventListener,
+                    dispatchResult,
+                    calls,
+                    receiverMatches,
                 ];
                 "#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!(["function", "function"]));
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "function", "function", "function", "function", true, 1, true
+            ])
+        );
     }
 
     /// Regression test for #285: DDoS-Guard's challenge calls

@@ -17,7 +17,11 @@ fn normalize_same_site(value: &str) -> String {
 }
 
 pub struct CookieJar {
-    cookies: RwLock<HashMap<String, HashMap<String, CookieEntry>>>,
+    /// domain -> (name, path) -> entry. RFC 6265 §5.3 identifies a cookie by
+    /// (name, domain, path); the outer map scopes by domain and the inner key
+    /// carries name+path so same-name cookies on different paths coexist
+    /// instead of clobbering each other.
+    cookies: RwLock<HashMap<String, HashMap<(String, String), CookieEntry>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -54,7 +58,7 @@ impl CookieJar {
 
         let request_host = url.host_str().unwrap_or("").to_lowercase();
         let mut domain_attr: Option<String> = None;
-        let mut path = url.path().to_string();
+        let mut path = default_cookie_path(url.path());
         let mut secure = false;
         let mut http_only = false;
         let mut expires: Option<u64> = None;
@@ -116,7 +120,7 @@ impl CookieJar {
             if exp == 0 {
                 let mut cookies = self.cookies.write().unwrap();
                 if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&name);
+                    domain_cookies.remove(&(name.clone(), path.clone()));
                 }
                 return;
             }
@@ -132,7 +136,7 @@ impl CookieJar {
         let entry = CookieEntry {
             name: name.clone(),
             value,
-            path,
+            path: path.clone(),
             domain: domain.clone(),
             host_only,
             secure,
@@ -142,7 +146,7 @@ impl CookieJar {
         };
 
         let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert(name, entry);
+        cookies.entry(domain).or_default().insert((name, path), entry);
     }
 
     pub fn get_cookie_header(&self, url: &Url) -> String {
@@ -174,7 +178,7 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -216,7 +220,7 @@ impl CookieJar {
             let entry = CookieEntry {
                 name: cookie.name.clone(),
                 value: cookie.value,
-                path: cookie.path,
+                path: cookie.path.clone(),
                 domain: cookie.domain.clone(),
                 // CDP/persisted import is trusted; honor the explicit domain as
                 // domain-scoped (matches the prior behavior).
@@ -226,7 +230,7 @@ impl CookieJar {
                 expires,
                 same_site,
             };
-            jar.entry(cookie.domain).or_default().insert(cookie.name, entry);
+            jar.entry(cookie.domain).or_default().insert((cookie.name, cookie.path), entry);
         }
     }
 
@@ -262,7 +266,7 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -282,7 +286,7 @@ impl CookieJar {
 
         let request_host = url.host_str().unwrap_or("").to_lowercase();
         let mut domain_attr: Option<String> = None;
-        let mut path = url.path().to_string();
+        let mut path = default_cookie_path(url.path());
         let mut secure = false;
         let mut expires: Option<u64> = None;
         let mut same_site = "Lax".to_string();
@@ -339,7 +343,7 @@ impl CookieJar {
             if exp == 0 {
                 let mut cookies = self.cookies.write().unwrap();
                 if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&name);
+                    domain_cookies.remove(&(name.clone(), path.clone()));
                 }
                 return;
             }
@@ -355,7 +359,7 @@ impl CookieJar {
         let entry = CookieEntry {
             name: name.clone(),
             value,
-            path,
+            path: path.clone(),
             domain: domain.clone(),
             host_only,
             secure,
@@ -365,14 +369,14 @@ impl CookieJar {
         };
 
         let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert(name, entry);
+        cookies.entry(domain).or_default().insert((name, path), entry);
     }
 
     pub fn delete_cookie(&self, name: &str, domain: &str) {
         let mut cookies = self.cookies.write().unwrap();
         if domain.is_empty() {
             for domain_cookies in cookies.values_mut() {
-                domain_cookies.remove(name);
+                domain_cookies.retain(|_k, e| e.name != name);
             }
         } else {
             let domains_to_try = [
@@ -382,7 +386,7 @@ impl CookieJar {
             ];
             for d in &domains_to_try {
                 if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
-                    domain_cookies.remove(name);
+                    domain_cookies.retain(|_k, e| e.name != name);
                 }
             }
         }
@@ -396,7 +400,7 @@ impl CookieJar {
         };
         if domain.is_empty() {
             for domain_cookies in cookies.values_mut() {
-                domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                domain_cookies.retain(|_k, e| !(e.name == name && matches_path(&e.path)));
             }
         } else {
             let domains_to_try = [
@@ -406,7 +410,7 @@ impl CookieJar {
             ];
             for d in &domains_to_try {
                 if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
-                    domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                    domain_cookies.retain(|_k, e| !(e.name == name && matches_path(&e.path)));
                 }
             }
         }
@@ -567,6 +571,40 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
     }
 }
 
+// RFC 6265 5.1.4 default-path: the path a cookie is scoped to when its
+// Set-Cookie carries no Path attribute. It is the request URI's directory — the
+// path up to but not including the right-most '/' — NOT the full request path.
+// Using the full path scopes a session cookie to the exact URL that set it: a
+// cookie set on `/app/login` would then not match `/app/dashboard`, silently
+// logging the user out on the next navigation. Browsers store `/app` here.
+pub fn default_cookie_path(request_path: &str) -> String {
+    // "If the uri-path is empty or if the first character is not '/', output /."
+    if !request_path.starts_with('/') {
+        return "/".to_string();
+    }
+    match request_path.rfind('/') {
+        // "If the uri-path contains no more than one '/', output /."
+        Some(0) | None => "/".to_string(),
+        // "Output the characters up to, but not including, the right-most '/'."
+        Some(idx) => request_path[..idx].to_string(),
+    }
+}
+
+// RFC 6265 5.1.4 path-match. A bare `starts_with` over-matches sibling paths
+// that share a string prefix (a Path=/admin cookie leaking to /administrator),
+// so a prefix match also requires the boundary to fall on a '/'.
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    // Prefix match: exact when the cookie-path already ends in '/', otherwise
+    // the next char of the request-path must be the '/' boundary.
+    cookie_path.ends_with('/') || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
+}
+
 fn domain_matches(host: &str, domain: &str) -> bool {
     // Avoid allocations on the hot path. Cookie lookup runs per fetch
     // (every subresource on a page) and walks every domain in the jar.
@@ -669,6 +707,53 @@ mod tests {
 
         jar.set_cookie("session=abc; Max-Age=0", &url);
         assert!(jar.get_cookie_header(&url).is_empty());
+    }
+
+    #[test]
+    fn test_same_name_cookies_with_different_paths_coexist() {
+        // RFC 6265 §5.3: a cookie is identified by (name, domain, path). Two
+        // cookies that share a name but differ in path are distinct and must
+        // both be retained — storing by name alone clobbers the first.
+        let jar = CookieJar::new();
+        let set_url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("id=1; Path=/a", &set_url);
+        jar.set_cookie("id=2; Path=/b", &set_url);
+
+        let header_a = jar.get_cookie_header(&Url::parse("https://example.com/a/page").unwrap());
+        let header_b = jar.get_cookie_header(&Url::parse("https://example.com/b/page").unwrap());
+        assert!(header_a.contains("id=1"), "/a must see the Path=/a cookie, got: {header_a:?}");
+        assert!(header_b.contains("id=2"), "/b must see the Path=/b cookie, got: {header_b:?}");
+        assert!(!header_a.contains("id=2"), "Path=/b cookie leaked to /a: {header_a:?}");
+        assert!(!header_b.contains("id=1"), "Path=/a cookie leaked to /b: {header_b:?}");
+    }
+
+    #[test]
+    fn test_same_name_same_path_cookie_is_replaced() {
+        // Same (name, path): the newer value replaces the older one — still
+        // one entry, not two.
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/a/x").unwrap();
+        jar.set_cookie("id=1; Path=/a", &url);
+        jar.set_cookie("id=2; Path=/a", &url);
+        let header = jar.get_cookie_header(&url);
+        assert!(header.contains("id=2"), "newer value must win: {header:?}");
+        assert!(!header.contains("id=1"), "old value must be replaced: {header:?}");
+    }
+
+    #[test]
+    fn test_max_age_zero_deletes_only_matching_path() {
+        // A Max-Age=0 Set-Cookie deletes the (name, path) it targets, leaving a
+        // same-name cookie on a different path intact.
+        let jar = CookieJar::new();
+        let set_url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("id=1; Path=/a", &set_url);
+        jar.set_cookie("id=2; Path=/b", &set_url);
+        jar.set_cookie("id=x; Path=/a; Max-Age=0", &set_url);
+
+        let header_a = jar.get_cookie_header(&Url::parse("https://example.com/a/page").unwrap());
+        let header_b = jar.get_cookie_header(&Url::parse("https://example.com/b/page").unwrap());
+        assert!(header_a.is_empty(), "Path=/a cookie should be deleted: {header_a:?}");
+        assert!(header_b.contains("id=2"), "Path=/b cookie must survive: {header_b:?}");
     }
 
     #[test]
@@ -947,5 +1032,84 @@ mod tests {
         assert!(jar.get_cookie_header(&apex).contains("token=1"));
         let api = Url::parse("http://api.example.com/").unwrap();
         assert!(jar.get_cookie_header(&api).contains("token=1"));
+    }
+
+    #[test]
+    fn cookie_path_requires_slash_boundary() {
+        // RFC 6265 5.1.4: a Path=/admin cookie must NOT be sent to a sibling
+        // path like /administrator that merely shares the string prefix. It is
+        // sent to /admin, /admin/, and /admin/x.
+        let jar = CookieJar::new();
+        let admin = Url::parse("https://example.com/admin").unwrap();
+        jar.set_cookie("sess=1; Path=/admin", &admin);
+
+        let sibling = Url::parse("https://example.com/administrator").unwrap();
+        assert!(
+            !jar.get_cookie_header(&sibling).contains("sess=1"),
+            "cookie leaked to sibling path /administrator: {}",
+            jar.get_cookie_header(&sibling)
+        );
+
+        assert!(jar.get_cookie_header(&admin).contains("sess=1"));
+        let exact_slash = Url::parse("https://example.com/admin/").unwrap();
+        assert!(jar.get_cookie_header(&exact_slash).contains("sess=1"));
+        let sub = Url::parse("https://example.com/admin/panel").unwrap();
+        assert!(jar.get_cookie_header(&sub).contains("sess=1"));
+    }
+
+    #[test]
+    fn default_cookie_path_is_request_directory() {
+        // RFC 6265 5.1.4 default-path: up to (not including) the right-most '/'.
+        assert_eq!(default_cookie_path("/app/login"), "/app");
+        assert_eq!(default_cookie_path("/app/"), "/app");
+        assert_eq!(default_cookie_path("/a/b/c"), "/a/b");
+        // No more than one '/', empty, or non-absolute -> "/".
+        assert_eq!(default_cookie_path("/foo"), "/");
+        assert_eq!(default_cookie_path("/"), "/");
+        assert_eq!(default_cookie_path(""), "/");
+        assert_eq!(default_cookie_path("relative"), "/");
+    }
+
+    #[test]
+    fn cookie_without_path_defaults_to_directory_not_full_path() {
+        // A Set-Cookie with no Path attribute on /app/login must scope to /app
+        // (RFC 6265 5.1.4), so the session survives navigation to /app/dashboard.
+        // Before this fix it was scoped to the full path /app/login and vanished
+        // on the next page, appearing as a silent logout.
+        let jar = CookieJar::new();
+        let login = Url::parse("https://example.com/app/login").unwrap();
+        jar.set_cookie("sid=abc", &login);
+
+        let dashboard = Url::parse("https://example.com/app/dashboard").unwrap();
+        assert!(
+            jar.get_cookie_header(&dashboard).contains("sid=abc"),
+            "session cookie was not sent to a sibling path under the same directory: {}",
+            jar.get_cookie_header(&dashboard)
+        );
+        // Still sent at the directory root and the original path.
+        let app_root = Url::parse("https://example.com/app/").unwrap();
+        assert!(jar.get_cookie_header(&app_root).contains("sid=abc"));
+        assert!(jar.get_cookie_header(&login).contains("sid=abc"));
+
+        // But not to an unrelated top-level path outside the directory.
+        let other = Url::parse("https://example.com/other").unwrap();
+        assert!(
+            !jar.get_cookie_header(&other).contains("sid=abc"),
+            "cookie leaked outside its default-path directory"
+        );
+    }
+
+    #[test]
+    fn js_cookie_without_path_also_defaults_to_directory() {
+        // document.cookie set on /shop/cart with no path must reach /shop/checkout.
+        let jar = CookieJar::new();
+        let cart = Url::parse("https://example.com/shop/cart").unwrap();
+        jar.set_cookie_from_js("cart=xyz", &cart);
+        let checkout = Url::parse("https://example.com/shop/checkout").unwrap();
+        assert!(
+            jar.get_js_visible_cookies(&checkout).contains("cart=xyz"),
+            "JS cookie not visible at sibling path: {}",
+            jar.get_js_visible_cookies(&checkout)
+        );
     }
 }

@@ -78,6 +78,13 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         workers: u16,
 
+        /// Maximum live CDP connections. Each connection runs on its own OS
+        /// thread with its own V8 isolates, so this bounds the server's thread
+        /// and memory footprint. Connections beyond the limit are refused with
+        /// a 503 rather than queued.
+        #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
+        max_connections: usize,
+
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
         /// files. Enable only when serving local HTML for testing
@@ -328,8 +335,12 @@ async fn main() -> anyhow::Result<()> {
     let stealth = args.stealth;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, workers, allow_file_access, storage_dir, quiet: _ }) => {
-            let proxy = merge_proxy(global_proxy.clone(), proxy);
+        Some(Command::Serve { port, host, proxy, user_agent, workers, max_connections, allow_file_access, storage_dir, quiet: _ }) => {
+            // Fall back to OBSCURA_PROXY so a proxy can be supplied without
+            // putting credentials on the command line. The multi-worker load
+            // balancer passes the proxy to each worker this way (issue #366).
+            let proxy = merge_proxy(global_proxy.clone(), proxy)
+                .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty()));
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -353,9 +364,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_serve_options(
+                obscura_cdp::start_with_serve_options_and_limit(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                    args.allow_private_network,
+                    args.allow_private_network, max_connections,
                 ).await?;
             }
         }
@@ -423,7 +434,11 @@ async fn run_multi_worker_serve(
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
-            cmd.arg("--proxy").arg(p);
+            // Pass the proxy (which may embed credentials) via the environment,
+            // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
+            // to any local user; OBSCURA_PROXY is only readable by the owner
+            // (issue #366). The worker's serve path reads this env as a fallback.
+            cmd.env("OBSCURA_PROXY", p);
         }
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
@@ -610,7 +625,7 @@ async fn run_fetch(
         });
     }
 
-    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition, false)).await {
+    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
@@ -940,56 +955,85 @@ fn dump_markdown(page: &mut Page) -> String {
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
+    // Iterative DFS over an explicit work stack. A recursive walk overflowed the
+    // call stack (a hard abort, not a catchable panic) on deeply nested pages,
+    // taking down the process on `--dump text` (issue #362, the CLI counterpart
+    // of the serialize/textContent paths made iterative in obscura-dom). A
+    // `Newline` work item emits a block element's trailing newline after its
+    // children, matching the old pre/post-recursion output exactly.
+    enum Work {
+        Visit(obscura_dom::NodeId),
+        Newline,
+    }
+
+    // Defense-in-depth cap mirroring DomTree::descendants; never reached on a
+    // valid tree since append_child / insert_before reject cycles.
+    const MAX_NODES: usize = 5_000_000;
+
     let mut result = String::new();
-    let node = match dom.get_node(node_id) {
-        Some(n) => n,
-        None => return result,
-    };
+    let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
+    let mut visited = 0usize;
 
-    match &node.data {
-        NodeData::Text { contents } => {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                result.push_str(trimmed);
-            }
-        }
-        NodeData::Element { name, .. } => {
-            let tag = name.local.as_ref();
-            let is_block = matches!(
-                tag,
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
-                    | "section" | "article" | "header" | "footer" | "nav"
-                    | "main" | "aside" | "figure" | "figcaption" | "table"
-                    | "thead" | "tbody" | "tfoot" | "dl" | "dt" | "dd"
-                    | "ul" | "ol"
-            );
-
-            // Boilerplate elements rarely contain content the user wants to
-            // scrape — strip them so `--dump text` returns the article body
-            // instead of menus, footers, and cookie banners.
-            if matches!(
-                tag,
-                "script" | "style" | "nav" | "header" | "footer" | "aside"
-            ) {
-                return result;
-            }
-
-            if is_block {
+    while let Some(work) = stack.pop() {
+        let id = match work {
+            Work::Newline => {
                 result.push('\n');
+                continue;
             }
+            Work::Visit(id) => id,
+        };
 
-            for child_id in dom.children(node_id) {
-                result.push_str(&extract_readable_text(dom, child_id));
-            }
-
-            if is_block {
-                result.push('\n');
-            }
+        visited += 1;
+        if visited > MAX_NODES {
+            break;
         }
-        _ => {
-            for child_id in dom.children(node_id) {
-                result.push_str(&extract_readable_text(dom, child_id));
+
+        let node = match dom.get_node(id) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        match &node.data {
+            NodeData::Text { contents } => {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    result.push_str(trimmed);
+                }
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.as_ref();
+
+                // Boilerplate elements rarely contain content the user wants to
+                // scrape — strip them so `--dump text` returns the article body
+                // instead of menus, footers, and cookie banners.
+                if matches!(tag, "script" | "style" | "nav" | "header" | "footer" | "aside") {
+                    continue;
+                }
+
+                let is_block = matches!(
+                    tag,
+                    "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                        | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
+                        | "section" | "article" | "header" | "footer" | "nav"
+                        | "main" | "aside" | "figure" | "figcaption" | "table"
+                        | "thead" | "tbody" | "tfoot" | "dl" | "dt" | "dd"
+                        | "ul" | "ol"
+                );
+
+                if is_block {
+                    result.push('\n');
+                    // Processed after all children (stack is LIFO): the trailing newline.
+                    stack.push(Work::Newline);
+                }
+                // Push children in reverse so they pop in document order.
+                for child_id in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
+                }
+            }
+            _ => {
+                for child_id in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
+                }
             }
         }
     }

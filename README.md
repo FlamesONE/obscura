@@ -53,19 +53,40 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
   <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=obscura" target="_blank">
-        <img alt="Swiftproxy" src="assets/sponsors/swiftproxy2.png" width="180"/>
+      <a href="https://sx.org/?c=40h-N7" target="_blank">
+        <img alt="SX.org" src="assets/sponsors/sxproxy.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=obscura"><b>Swiftproxy</b></a>  — Premium residential proxies built for privacy, automation, and scale.<br><br>
-<b>80M+ residential IPs in 190+ countries<br>
-Rotating & sticky sessions<br>
-Non-expiring traffic<br>
-Free trial available<br>
-Country, state & city targeting<br>
-HTTP, HTTPS & SOCKS5 support<br><br>
-🎁 Use code <b>PROXY90</b> for <b>10% off</b>.<br><br></b>
+      🚀 <b>Obscura × SX.org</b><br>
+      Using Obscura for AI agents, browser automation, or web scraping? Power your workflow with stable proxies from <a href="https://sx.org/?c=40h-N7"><b>SX.org</b></a>.<br><br>
+      <b>🌍 12M+ IPs across 235 countries<br>
+      🏠 7M+ residential IPs<br>
+      📱 4M+ mobile IPs<br>
+      🏢 1M+ corporate proxies<br>
+      🔁 Rotating & sticky sessions<br>
+      📍 Flexible geo setup<br>
+      🌐 HTTP, HTTPS & SOCKS5 support<br>
+      ⚡ Up to 99.97% connection success<br>
+      🛟 24/7 support<br><br>
+      🎁 Use code <b>Obscura3gb</b> to get a <b>free 3GB trial</b>.<br><br></b>
+      Stable proxies. Fewer blocks. Most reliable Obscura automation.
+    </td>
+  </tr>
+   <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://go.nodemaven.com/obscura" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      <a href="https://go.nodemaven.com/obscuraread"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
+      <b>99.9% uptime<br>
+      Sticky sessions up to 7 days<br>
+      IP filtering on every proxy<br>
+      No KYC required<br>
+      Cashback on traffic — earn up to 10% back<br><br></b>
+      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
     </td>
   </tr>
   <tr>
@@ -86,18 +107,6 @@ HTTP, HTTPS & SOCKS5 support<br><br>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
   </tr>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=h4ckf0r0day" target="_blank">
-        <img alt="MangoProxy" src="assets/sponsors/mangoproxy.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=h4ckf0r0day"><b>MangoProxy</b></a> provides residential, ISP, datacenter, and mobile proxies in 200+ countries. Trusted by businesses worldwide for stable connections, fast response times, and scalable proxy infrastructure.<br>
-      Use Promo code <b>OBSCURA</b> for 8% off Static ISP Proxies.
-    </td>
-  </tr>
-    <tr>
       <td width="200" align="center" valign="middle">
         <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
           <img alt="9Proxy" src="assets/sponsors/9proxy.png" width="180"/>
@@ -108,22 +117,6 @@ HTTP, HTTPS & SOCKS5 support<br><br>
   just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
       </td>
     </tr>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscura" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://go.nodemaven.com/obscura"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
-      <b>99.9% uptime<br>
-      Sticky sessions up to 7 days<br>
-      IP filtering on every proxy<br>
-      No KYC required<br>
-      Cashback on traffic — earn up to 10% back<br><br></b>
-      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
-    </td>
-  </tr>
   <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://www.rapidproxy.io/?ref=obscura" target="_blank">
@@ -358,10 +351,13 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
 | **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
 | **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
-| **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception) |
+| **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception), takeResponseBodyAsStream |
+| **IO** | read, close (stream a large response body in chunks) |
 | **Storage** | getCookies, setCookies, deleteCookies |
 | **Input** | dispatchMouseEvent, dispatchKeyEvent |
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
+
+To download a large resource without one giant `Network.getResponseBody` blob, call `Fetch.takeResponseBodyAsStream` then read it in chunks with `IO.read` / `IO.close`. Response bodies over the cache limit (`OBSCURA_NETWORK_BODY_BUFFER_BYTES`, default 2 MiB) are not retained, so raise that limit when you intend to stream large downloads.
 ## CLI Reference
 
 ### Tuning V8
@@ -370,6 +366,14 @@ Obscura embeds V8 directly. Use `--v8-flags` to pass raw flags through to V8, sa
 
 ```bash
 obscura --v8-flags "--max-old-space-size=4096" fetch <url>
+```
+
+### Heavy SPAs (script execution budget)
+
+Obscura caps the page's script-execution phase so one slow or hung page cannot stall a worker. The default budget is 30s; pages that finish sooner return immediately, so the cap only affects pages that keep running. A very heavy React/Vue/Angular SPA on a slow network can need more time to boot before it fires its data requests. Raise the budget with `OBSCURA_SCRIPT_DEADLINE_MS` (milliseconds), and pair it with a matching navigation timeout in your CDP client:
+
+```bash
+OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve --port 9222
 ```
 
 ### `obscura serve`

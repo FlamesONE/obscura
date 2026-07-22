@@ -699,7 +699,7 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
         page.http_client.set_user_agent(ua).await;
     }
 
-    page.navigate_with_wait(url, condition, false).await
+    page.navigate_with_wait(url, condition).await
         .map_err(|e| e.to_string())?;
 
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
@@ -1100,7 +1100,7 @@ async fn tool_back(state: &mut BrowserState) -> Result<String, String> {
     page.set_history_index(prev_idx);
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
     let stash = (page.history.clone(), page.history_index);
-    page.navigate_with_wait(&url, condition, false).await.map_err(|e| e.to_string())?;
+    page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
     page.history = stash.0;
     page.history_index = stash.1;
@@ -1118,7 +1118,7 @@ async fn tool_forward(state: &mut BrowserState) -> Result<String, String> {
     page.set_history_index(next_idx);
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
     let stash = (page.history.clone(), page.history_index);
-    page.navigate_with_wait(&url, condition, false).await.map_err(|e| e.to_string())?;
+    page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
     page.history = stash.0;
     page.history_index = stash.1;
@@ -1132,7 +1132,7 @@ async fn tool_reload(state: &mut BrowserState) -> Result<String, String> {
         return Err("Nothing to reload.".to_string());
     }
     let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
-    state.page_mut().navigate_with_wait(&url, condition, false).await.map_err(|e| e.to_string())?;
+    state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     state.interactive_refs.clear();
     Ok(format!("Reloaded {url}"))
 }
@@ -1511,7 +1511,7 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
         if let Some(ref ua) = ua {
             page.http_client.set_user_agent(ua).await;
         }
-        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded, false)
+        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
             .await.map_err(|e| e.to_string())?;
         Ok(format!("Opened {id} and navigated to {}", page.url_string()))
     } else {

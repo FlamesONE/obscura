@@ -2433,6 +2433,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures-util",
+ "libc",
  "obscura-browser",
  "obscura-dom",
  "obscura-js",

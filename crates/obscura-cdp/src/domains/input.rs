@@ -93,10 +93,10 @@ pub async fn handle(
                                     var type = (target.getAttribute && target.getAttribute('type') || '').toLowerCase();\
                                     if (tag === 'BUTTON' && type !== 'button' && type !== 'reset') {{\
                                         var form = target.closest ? target.closest('form') : null;\
-                                        if (form && typeof form.submit === 'function') {{ try {{ form.submit(target); }} catch(e) {{}} }}\
+                                        if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(target); }} else {{ form.submit(target); }} }} catch(e) {{}} }}\
                                     }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
                                         var form2 = target.closest ? target.closest('form') : null;\
-                                        if (form2 && typeof form2.submit === 'function') {{ try {{ form2.submit(target); }} catch(e) {{}} }}\
+                                        if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(target); }} else {{ form2.submit(target); }} }} catch(e) {{}} }}\
                                     }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
                                         target.checked = !target.checked;\
                                         try {{ target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
@@ -151,8 +151,12 @@ pub async fn handle(
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
-                            key = key.replace('\'', "\\'"),
-                            code = code.replace('\'', "\\'"),
+                            // Escape backslash BEFORE single-quote (as the text
+                            // path below does) so a key like "\" — Chrome's
+                            // backslash key — doesn't escape the closing quote
+                            // and produce a syntax error that drops the event.
+                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
+                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
                         page.evaluate(&js);
 
@@ -177,7 +181,7 @@ pub async fn handle(
                                     target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form || (target.closest && target.closest('form'));\
-                                    if (form && typeof form.submit === 'function') form.submit();\
+                                    if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
                                 }\
                             })()";
                             page.evaluate(js);
@@ -194,8 +198,8 @@ pub async fn handle(
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
-                            key = key.replace('\'', "\\'"),
-                            code = code.replace('\'', "\\'"),
+                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
+                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
                         page.evaluate(&js);
                     }
