@@ -6475,13 +6475,13 @@ class _Canvas2D {
     this.canvas = canvas;
     this._w = parseInt(canvas.getAttribute('width')) || 300;
     this._h = parseInt(canvas.getAttribute('height')) || 150;
+    // An untouched canvas is transparent black in real Chrome — every pixel
+    // [0,0,0,0]. The old code pre-filled it with white+noise, so getImageData on
+    // a blank canvas returned opaque ~255 pixels (sannysoft TRANSPARENT_PIXEL
+    // warn, and a transparent-pixel probe tell). Uint8ClampedArray is already
+    // zero-initialized; the canvas fingerprint comes from seeded drawing
+    // (fillText/_setPixel using the F1 session seed), not from a noisy blank.
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
-    for (let i = 0; i < this._w * this._h; i++) {
-      this._buf[i*4+0] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 0));
-      this._buf[i*4+1] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 1));
-      this._buf[i*4+2] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 2));
-      this._buf[i*4+3] = 255;
-    }
     this.fillStyle = '#000000';
     this.strokeStyle = '#000000';
     this.lineWidth = 1;
