@@ -712,23 +712,51 @@ async fn cdp_processor(
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
 
+    // Continuous event-loop pump. Real Chrome drives the page event loop
+    // continuously; obscura only settled once right after navigation, so a page
+    // that schedules async work LATER — long setTimeout chains, promise cascades,
+    // a worker-thread fingerprinter (CreepJS's getWorkerData) — stalled between
+    // CDP commands: its callbacks never fired, and anything awaiting them hung
+    // forever. When the wire is idle, drive each JS page a small slice so that
+    // work keeps progressing. Bounded per tick so it never starves message
+    // handling, and only runs while a connection is idle.
+    let mut pump = tokio::time::interval(std::time::Duration::from_millis(25));
+    pump.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
         // Isolate is the one dispatch is about to touch.
         let msg = if let Some(d) = deferred.pop_front() {
-            d
+            Some(d)
         } else {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(m) => m,
+                    Some(m) => Some(m),
                     None => break,
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 }
+                _ = pump.tick() => None,
+            }
+        };
+
+        let msg = match msg {
+            Some(m) => m,
+            None => {
+                // Idle tick: advance each JS page's event loop a bounded slice.
+                // Sequential (never two isolates entered at once — each settle
+                // enters and exits its own isolate before the next), so the V8
+                // one-isolate-per-thread invariant holds.
+                for page in ctx.pages.iter_mut() {
+                    if page.has_js() {
+                        page.settle(10).await;
+                    }
+                }
+                continue;
             }
         };
 
