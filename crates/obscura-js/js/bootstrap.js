@@ -3315,155 +3315,142 @@ function _uaBrands() {
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
-globalThis.navigator = {
-  onLine: true, cookieEnabled: true,
-  maxTouchPoints: 0,
-  vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
-  doNotTrack: null,
-  connection: new NetworkInformation(),
-  pdfViewerEnabled: true,
-  userAgentData: {
-    mobile: false,
-    get brands() { return _uaBrands(); },
-    get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
-    getHighEntropyValues(hints) {
-      var brands = _uaBrands();
-      return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
-        brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
-        mobile: false,
-        model: "",
-        platform: globalThis.__obscura_ua_platform || "Windows",
-        platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
-        wow64: false,
-      });
-    },
-    toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
-  },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
-  mediaDevices: {
-    enumerateDevices() {
-      return Promise.resolve([
-        {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
-        {deviceId:"comms",kind:"audioinput",label:"",groupId:"comms"},
-        {deviceId:"default",kind:"audiooutput",label:"",groupId:"default"},
-        {deviceId:"",kind:"videoinput",label:"",groupId:""},
-      ]);
-    },
-    getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    addEventListener(){}, removeEventListener(){},
-  },
-  clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
-  permissions: { query(params){
-    var n = params && params.name;
-    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
-    // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
-  } },
-  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
-  getGamepads() { return []; },
-  sendBeacon() { return true; },
-  javaEnabled() { return false; },
-  geolocation: {
-    getCurrentPosition(success, error) {
-      const coords = {
-        latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
-        longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1,
-        accuracy: 10 + _fpRand(502) * 40,
-        altitude: null,
-        altitudeAccuracy: null,
-        heading: null,
-        speed: null,
-      };
-      const pos = { coords, timestamp: Date.now() };
-      if (typeof success === 'function') success(pos);
-    },
-    watchPosition(success, error) {
-      if (typeof success === 'function') {
-        const coords = {
-          latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1,
-          longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1,
-          accuracy: 10 + _fpRand(505) * 40,
-          altitude: null,
-          altitudeAccuracy: null,
-          heading: null,
-          speed: null,
-        };
-        success({ coords, timestamp: Date.now() });
-      }
-      return 0;
-    },
-    clearWatch() {},
-  },
-  storage: {
-    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
-    persist() { return Promise.resolve(false); },
-    persisted() { return Promise.resolve(false); },
-  },
-};
-
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
-// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
-// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
+// Real Chrome's navigator instance carries ZERO own properties — every
+// fingerprint surface lives as an accessor on Navigator.prototype. rebrowser and
+// CreepJS both check Object.getOwnPropertyNames(navigator).length===0 AND
+// Object.getPrototypeOf(navigator)===Navigator.prototype. The earlier design used
+// an intermediate _navProto hop (own-prop-free, but getPrototypeOf then pointed at
+// _navProto, not Navigator.prototype — a splice tell). Define everything directly
+// on Navigator.prototype instead; sub-objects are memoized so navigator.x===x.
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
-
+  var P = Navigator.prototype;
+  var DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
   function defGetter(key, fn) {
     _markNative(fn);
-    Object.defineProperty(_navProto, key, {
-      get: fn, set: undefined, enumerable: true, configurable: true,
-    });
+    Object.defineProperty(P, key, { get: fn, set: undefined, enumerable: true, configurable: true });
+  }
+  // Memoized sub-object getter: builds once, then returns the SAME instance so
+  // navigator.mediaDevices === navigator.mediaDevices (a per-call rebuild is a tell).
+  function defMemo(key, build) {
+    var cache, built = false;
+    defGetter(key, function() { if (!built) { cache = build(); built = true; } return cache; });
+  }
+  function defMethod(key, fn) {
+    _markNative(fn);
+    Object.defineProperty(P, key, { value: fn, writable: true, enumerable: true, configurable: true });
   }
 
+  // --- primitive accessors ---
   defGetter('webdriver', function() { return false; });
-  defGetter('userAgent', function() {
-    return globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-  });
-  defGetter('appVersion', function() {
-    return (globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
-  });
-  defGetter('platform', function() {
-    return globalThis.__obscura_platform || "Win32";
-  });
-  // CDP Emulation.setLocaleOverride wins over the built-in default; falls back
-  // to en-US when no override was pushed for this page.
+  defGetter('userAgent', function() { return globalThis.__obscura_ua || DEFAULT_UA; });
+  defGetter('appVersion', function() { return (globalThis.__obscura_ua || DEFAULT_UA).replace('Mozilla/', ''); });
+  defGetter('appCodeName', function() { return "Mozilla"; });
+  defGetter('appName', function() { return "Netscape"; });
+  defGetter('platform', function() { return globalThis.__obscura_platform || "Win32"; });
+  defGetter('vendor', function() { return "Google Inc."; });
+  defGetter('vendorSub', function() { return ""; });
+  defGetter('product', function() { return "Gecko"; });
+  defGetter('productSub', function() { return "20030107"; });
+  defGetter('doNotTrack', function() { return null; });
+  defGetter('onLine', function() { return true; });
+  defGetter('cookieEnabled', function() { return true; });
+  defGetter('maxTouchPoints', function() { return 0; });
+  defGetter('pdfViewerEnabled', function() { return true; });
+  // CDP Emulation.setLocaleOverride wins over the built-in default.
   defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
   defGetter('languages', function() { return globalThis.__obscura_languages || ["en-US", "en"]; });
-
-  // Build PDF plugins/mimeTypes with the full cross-referenced shape real
-  // Chrome exposes: each Plugin carries its enabledPlugin-linked MimeType so
-  // `plugins[0][0].enabledPlugin === plugins[0]` and `plugins[0].length > 0`
-  // hold (fingerprint scripts check both). Built lazily on first access (never
-  // eagerly in this IIFE — a throw here would abort the whole bootstrap) and
-  // cached so navigator.plugins === navigator.plugins.
-  defGetter('plugins', function() { _buildPdfPluginsAndMimeTypes(); return _pdfPluginArray; });
-  defGetter('mimeTypes', function() { _buildPdfPluginsAndMimeTypes(); return _pdfMimeTypeArray; });
-
-  // Values set per-page by __obscura_init (avoids own data props on navigator).
-  // A CDP Emulation.setHardwareConcurrencyOverride (__obscura_hardware_concurrency)
-  // takes precedence over the randomized fingerprint value (__obscura_hw).
+  // CDP setHardwareConcurrencyOverride wins over the randomized fingerprint value.
   defGetter('hardwareConcurrency', function() {
     var cdp = globalThis.__obscura_hardware_concurrency;
     return cdp != null ? cdp : (globalThis.__obscura_hw || 8);
   });
   defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
+  // PDF plugins/mimeTypes with Chrome's full cross-referenced shape (plugins[0][0]
+  // .enabledPlugin === plugins[0], plugins[0].length > 0). Lazy + cached.
+  defGetter('plugins', function() { _buildPdfPluginsAndMimeTypes(); return _pdfPluginArray; });
+  defGetter('mimeTypes', function() { _buildPdfPluginsAndMimeTypes(); return _pdfMimeTypeArray; });
 
-  _navProto.share = _markNative(function share(data) {
-    return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  // --- memoized sub-objects (identity-stable) ---
+  defMemo('connection', function() { return new NetworkInformation(); });
+  defMemo('userAgentData', function() {
+    return {
+      mobile: false,
+      get brands() { return _uaBrands(); },
+      get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
+      getHighEntropyValues: function(hints) {
+        var brands = _uaBrands();
+        return Promise.resolve({
+          architecture: "x86", bitness: "64", brands: brands,
+          fullVersionList: brands.map(function(b) { return { brand: b.brand, version: b.version + ".0.0.0" }; }),
+          mobile: false, model: "",
+          platform: globalThis.__obscura_ua_platform || "Windows",
+          platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
+          uaFullVersion: _chromeMajor() + ".0.0.0", wow64: false,
+        });
+      },
+      toJSON: function() { return { brands: this.brands, mobile: this.mobile, platform: this.platform }; },
+    };
   });
-  _navProto.canShare = _markNative(function canShare() { return false; });
+  defMemo('serviceWorker', function() {
+    return { ready: Promise.resolve(), register: function() { return Promise.resolve(); }, getRegistrations: function() { return Promise.resolve([]); }, controller: null, oncontrollerchange: null, onmessage: null, addEventListener: function() {}, removeEventListener: function() {}, dispatchEvent: function() { return true; } };
+  });
+  defMemo('mediaDevices', function() {
+    return {
+      enumerateDevices: function() {
+        return Promise.resolve([
+          { deviceId: "default", kind: "audioinput", label: "", groupId: "default" },
+          { deviceId: "comms", kind: "audioinput", label: "", groupId: "comms" },
+          { deviceId: "default", kind: "audiooutput", label: "", groupId: "default" },
+          { deviceId: "", kind: "videoinput", label: "", groupId: "" },
+        ]);
+      },
+      getUserMedia: function() { return Promise.reject(new DOMException("NotAllowedError")); },
+      getDisplayMedia: function() { return Promise.reject(new DOMException("NotAllowedError")); },
+      getSupportedConstraints: function() { return { aspectRatio: true, autoGainControl: true, deviceId: true, echoCancellation: true, facingMode: true, frameRate: true, groupId: true, height: true, noiseSuppression: true, sampleRate: true, sampleSize: true, width: true }; },
+      addEventListener: function() {}, removeEventListener: function() {}, ondevicechange: null,
+    };
+  });
+  defMemo('clipboard', function() { return { writeText: function() { return Promise.resolve(); }, readText: function() { return Promise.resolve(""); } }; });
+  defMemo('permissions', function() {
+    return { query: function(params) {
+      var n = params && params.name;
+      // Chrome defaults privacy-sensitive permissions to "prompt", not "granted".
+      if (n === 'notifications') return Promise.resolve({ state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null });
+      if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({ state: 'prompt', onchange: null });
+      return Promise.resolve({ state: 'granted', onchange: null });
+    } };
+  });
+  defMemo('geolocation', function() {
+    return {
+      getCurrentPosition: function(success) {
+        var coords = { latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1, longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1, accuracy: 10 + _fpRand(502) * 40, altitude: null, altitudeAccuracy: null, heading: null, speed: null };
+        if (typeof success === 'function') success({ coords: coords, timestamp: Date.now() });
+      },
+      watchPosition: function(success) {
+        if (typeof success === 'function') {
+          var coords = { latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1, longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1, accuracy: 10 + _fpRand(505) * 40, altitude: null, altitudeAccuracy: null, heading: null, speed: null };
+          success({ coords: coords, timestamp: Date.now() });
+        }
+        return 0;
+      },
+      clearWatch: function() {},
+    };
+  });
+  defMemo('storage', function() { return { estimate: function() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); }, persist: function() { return Promise.resolve(false); }, persisted: function() { return Promise.resolve(false); } }; });
 
-  Object.setPrototypeOf(globalThis.navigator, _navProto);
+  // --- methods ---
+  defMethod('getBattery', function getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener: function() {} }); });
+  defMethod('getGamepads', function getGamepads() { return []; });
+  defMethod('sendBeacon', function sendBeacon() { return true; });
+  defMethod('javaEnabled', function javaEnabled() { return false; });
+  defMethod('share', function share() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  defMethod('canShare', function canShare() { return false; });
+
+  Object.defineProperty(P, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+
+  // Zero-own-prop instance whose [[Prototype]] IS Navigator.prototype.
+  globalThis.navigator = Object.create(P);
 })();
 
 globalThis.chrome = {
@@ -7147,33 +7134,23 @@ if (typeof PointerEvent === 'undefined') {
   };
 }
 
-if (typeof navigator.credentials === 'undefined') {
-  navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
-}
-
-navigator.mediaCapabilities = {
-  decodingInfo(cfg) {
-    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
-  },
-  encodingInfo(cfg) {
-    return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
-  },
-};
-navigator.locks = {
-  request(name, opts, cb) {
-    if (typeof opts === 'function') { cb = opts; opts = {}; }
-    if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
-    return Promise.resolve(null);
-  },
-  query() { return Promise.resolve({ held: [], pending: [] }); },
-};
-navigator.keyboard = {
-  getLayoutMap() { return Promise.resolve(new Map()); },
-  lock() { return Promise.resolve(); },
-  unlock() {},
-};
-navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
-navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+// These navigator surfaces must also live on Navigator.prototype (memoized), not
+// as own props on the instance, or they reintroduce the own-props tell fixed above.
+(function() {
+  var P = Navigator.prototype;
+  function memo(key, build) {
+    var c, b = false;
+    var g = function() { if (!b) { c = build(); b = true; } return c; };
+    _markNative(g);
+    Object.defineProperty(P, key, { get: g, set: undefined, enumerable: true, configurable: true });
+  }
+  memo('credentials', function() { return { get: function() { return Promise.resolve(null); }, create: function() { return Promise.resolve(null); }, store: function() { return Promise.resolve(); }, preventSilentAccess: function() { return Promise.resolve(); } }; });
+  memo('mediaCapabilities', function() { return { decodingInfo: function(cfg) { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg }); }, encodingInfo: function(cfg) { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg }); } }; });
+  memo('locks', function() { return { request: function(name, opts, cb) { if (typeof opts === 'function') { cb = opts; opts = {}; } if (typeof cb === 'function') return Promise.resolve(cb({ name: name, mode: (opts && opts.mode) || 'exclusive' })); return Promise.resolve(null); }, query: function() { return Promise.resolve({ held: [], pending: [] }); } }; });
+  memo('keyboard', function() { return { getLayoutMap: function() { return Promise.resolve(new Map()); }, lock: function() { return Promise.resolve(); }, unlock: function() {} }; });
+  memo('gpu', function() { return { requestAdapter: function() { return Promise.resolve(null); } }; });
+  memo('wakeLock', function() { return { request: function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } }; });
+})();
 
 globalThis.opener = null;
 
