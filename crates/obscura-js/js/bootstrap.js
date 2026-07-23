@@ -3474,11 +3474,15 @@ function _uaBrands() {
   defMemo('mediaDevices', function() {
     return {
       enumerateDevices: function() {
+        // Before any getUserMedia permission grant, a real browser masks every
+        // device: deviceId, label and groupId are all "". Exposing real-looking
+        // ids ("default"/"comms") without permission is a classic anti-detect
+        // tell (fake device enumeration). Match Chrome's no-permission shape:
+        // one entry per kind, all fields empty but `kind`, in input→output order.
         return Promise.resolve([
-          { deviceId: "default", kind: "audioinput", label: "", groupId: "default" },
-          { deviceId: "comms", kind: "audioinput", label: "", groupId: "comms" },
-          { deviceId: "default", kind: "audiooutput", label: "", groupId: "default" },
+          { deviceId: "", kind: "audioinput", label: "", groupId: "" },
           { deviceId: "", kind: "videoinput", label: "", groupId: "" },
+          { deviceId: "", kind: "audiooutput", label: "", groupId: "" },
         ]);
       },
       getUserMedia: function() { return Promise.reject(new DOMException("NotAllowedError")); },
@@ -3513,7 +3517,15 @@ function _uaBrands() {
       clearWatch: function() {},
     };
   });
-  defMemo('storage', function() { return { estimate: function() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); }, persist: function() { return Promise.resolve(false); }, persisted: function() { return Promise.resolve(false); } }; });
+  defMemo('storage', function() { return { estimate: function() {
+    // A round 5e9 decimal quota + non-zero usage on a fresh page was a tell:
+    // Chrome reports a binary-GiB quota (~fraction of disk) and usage 0 on a
+    // site that has stored nothing. Seed a realistic ~40-96 GiB quota and
+    // report usage 0.
+    var gib = 1073741824;
+    var quota = Math.round((40 + _fpRand(640) * 56) * gib);
+    return Promise.resolve({ quota: quota, usage: 0, usageDetails: {} });
+  }, persist: function() { return Promise.resolve(false); }, persisted: function() { return Promise.resolve(false); } }; });
 
   // --- methods ---
   defMethod('getBattery', function getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener: function() {} }); });
