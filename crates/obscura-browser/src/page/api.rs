@@ -47,6 +47,15 @@ impl Page {
         }
     }
 
+    /// Drain console.* messages buffered by the JS runtime so the CDP layer can
+    /// emit Runtime.consoleAPICalled for them. Empty when no runtime yet.
+    pub fn take_js_console_msgs(&self) -> Vec<obscura_js::ops::JsConsoleMsg> {
+        self.js
+            .as_ref()
+            .map(|js| js.take_js_console_msgs())
+            .unwrap_or_default()
+    }
+
     pub fn dom(&self) -> Option<&DomTree> {
         self.dom.as_ref()
     }

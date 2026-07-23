@@ -42,6 +42,11 @@ async fn emit_post_eval_nav(
         WaitUntil::Load,
         reached_idle,
     );
+    let console_msgs = ctx
+        .get_session_page(session_id)
+        .map(|p| p.take_js_console_msgs())
+        .unwrap_or_default();
+    super::page::emit_console_events(ctx, session_id, console_msgs);
     Ok(())
 }
 
@@ -128,6 +133,13 @@ pub async fn handle(
                     ));
                 }
             };
+            // Surface page console.* (DIAG etc.) accumulated during this call —
+            // polling clients thus drain async console between evaluations.
+            let console_msgs = ctx
+                .get_session_page(session_id)
+                .map(|p| p.take_js_console_msgs())
+                .unwrap_or_default();
+            super::page::emit_console_events(ctx, session_id, console_msgs);
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -164,6 +176,13 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info =
                 page.call_function_on_for_cdp(function_declaration, object_id, &arguments, return_by_value, await_promise).await;
+            // Surface page console.* (DIAG etc.) accumulated during this call —
+            // polling clients thus drain async console between evaluations.
+            let console_msgs = ctx
+                .get_session_page(session_id)
+                .map(|p| p.take_js_console_msgs())
+                .unwrap_or_default();
+            super::page::emit_console_events(ctx, session_id, console_msgs);
             emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))

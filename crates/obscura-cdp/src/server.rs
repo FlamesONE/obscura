@@ -1149,6 +1149,7 @@ async fn process_with_interception(
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
+    let console_msgs = page.take_js_console_msgs();
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();
     let reached_network_idle = page.lifecycle.is_network_idle();
@@ -1184,6 +1185,7 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    crate::domains::page::emit_console_events(ctx, &session_for_events, console_msgs);
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);

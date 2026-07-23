@@ -1112,6 +1112,12 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().js_network_events)
     }
 
+    /// Drain buffered console.* messages so the CDP layer can emit them as
+    /// Runtime.consoleAPICalled events. Idempotent (queue is taken).
+    pub fn take_js_console_msgs(&self) -> Vec<crate::ops::JsConsoleMsg> {
+        std::mem::take(&mut self.state.borrow_mut().js_console_msgs)
+    }
+
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {

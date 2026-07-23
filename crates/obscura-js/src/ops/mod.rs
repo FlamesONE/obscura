@@ -84,6 +84,16 @@ pub struct JsNetworkEvent {
     pub timestamp: f64,
 }
 
+/// A console.* message captured in the V8 op layer. Drained by the CDP layer
+/// into `Runtime.consoleAPICalled` events so clients (and our own CF diagnostics)
+/// can see page console output live — obscura otherwise only sent it to tracing.
+#[derive(Debug, Clone)]
+pub struct JsConsoleMsg {
+    pub level: String,
+    pub msg: String,
+    pub timestamp: f64,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     /// Cached real layout geometry keyed by obscura-dom NodeId u32, computed
@@ -135,6 +145,9 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    // console.* messages captured in the op layer, drained by the Page into CDP
+    // Runtime.consoleAPICalled events (live console for clients + CF diagnostics).
+    pub js_console_msgs: Vec<JsConsoleMsg>,
     // Live WebSocket connections opened by page JS (`new WebSocket(url)`),
     // keyed by the id handed back to the shim. Each holds the driver channels
     // (see obscura_net::ws) that op_ws_send / op_ws_recv pump. Stealth-only:
@@ -172,6 +185,7 @@ impl ObscuraState {
             fetched_urls: Vec::new(),
             frame_snapshots: HashMap::new(),
             js_network_events: Vec::new(),
+            js_console_msgs: Vec::new(),
             #[cfg(feature = "stealth")]
             ws_conns: HashMap::new(),
             #[cfg(feature = "stealth")]

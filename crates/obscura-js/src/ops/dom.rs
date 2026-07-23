@@ -476,10 +476,27 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 
 #[op2(fast)]
 pub(super) fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
-    let _ = state;
     match level {
         "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
         _ => tracing::info!(target: "obscura::console", "{}", msg),
+    }
+    // Buffer for the CDP layer to emit as Runtime.consoleAPICalled. Capped so a
+    // console-flooding page can't grow this unbounded before a drain.
+    let gs_rc = state.borrow::<SharedState>().clone();
+    let mut gs = gs_rc.borrow_mut();
+    gs.js_console_msgs.push(crate::ops::JsConsoleMsg {
+        level: level.to_string(),
+        msg: msg.to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0,
+    });
+    const MAX_JS_CONSOLE_MSGS: usize = 4096;
+    if gs.js_console_msgs.len() > MAX_JS_CONSOLE_MSGS {
+        let overflow = gs.js_console_msgs.len() - MAX_JS_CONSOLE_MSGS;
+        gs.js_console_msgs.drain(0..overflow);
     }
 }

@@ -5,6 +5,37 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
+/// Emit buffered page console.* messages as `Runtime.consoleAPICalled` events.
+/// obscura previously routed console only to tracing, so CDP clients (and our
+/// own CF challenge diagnostics) never saw page console output. Drained at the
+/// navigate and evaluate boundaries. Uses the default main-world context id (2,
+/// see emit_navigation_events) since these originate in the page realm.
+pub fn emit_console_events(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    msgs: Vec<obscura_js::ops::JsConsoleMsg>,
+) {
+    for m in msgs {
+        let cdp_type = match m.level.as_str() {
+            "error" => "error",
+            "warn" => "warning",
+            "info" => "info",
+            "debug" => "debug",
+            _ => "log",
+        };
+        ctx.pending_events.push(CdpEvent {
+            method: "Runtime.consoleAPICalled".into(),
+            params: json!({
+                "type": cdp_type,
+                "args": [{"type": "string", "value": m.msg}],
+                "executionContextId": 2,
+                "timestamp": m.timestamp,
+            }),
+            session_id: session_id.clone(),
+        });
+    }
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
