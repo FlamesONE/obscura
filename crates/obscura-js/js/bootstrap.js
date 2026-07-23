@@ -6863,6 +6863,22 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
+// Extensions a real ANGLE/Chrome WebGL1 context advertises (~39). Used by both
+// getSupportedExtensions() and getExtension() so they agree; the previous
+// 4-item list made obscura's WebGL match no real GPU.
+const _WEBGL_EXTENSIONS = [
+  'ANGLE_instanced_arrays','EXT_blend_minmax','EXT_clip_control','EXT_color_buffer_half_float',
+  'EXT_depth_clamp','EXT_disjoint_timer_query','EXT_float_blend','EXT_frag_depth',
+  'EXT_polygon_offset_clamp','EXT_shader_texture_lod','EXT_texture_compression_bptc',
+  'EXT_texture_compression_rgtc','EXT_texture_filter_anisotropic','EXT_texture_mirror_clamp_to_edge',
+  'EXT_sRGB','KHR_parallel_shader_compile','OES_element_index_uint','OES_fbo_render_mipmap',
+  'OES_standard_derivatives','OES_texture_float','OES_texture_float_linear','OES_texture_half_float',
+  'OES_texture_half_float_linear','OES_vertex_array_object','WEBGL_blend_func_extended',
+  'WEBGL_color_buffer_float','WEBGL_compressed_texture_astc','WEBGL_compressed_texture_etc',
+  'WEBGL_compressed_texture_etc1','WEBGL_compressed_texture_pvrtc','WEBGL_compressed_texture_s3tc',
+  'WEBGL_compressed_texture_s3tc_srgb','WEBGL_debug_renderer_info','WEBGL_debug_shaders',
+  'WEBGL_depth_texture','WEBGL_draw_buffers','WEBGL_lose_context','WEBGL_multi_draw','WEBGL_polygon_mode',
+];
 Element.prototype.getContext = function getContext(type) {
   if (type === '2d') {
     if (!this._ctx) {
@@ -6892,6 +6908,12 @@ Element.prototype.getContext = function getContext(type) {
       uniform2f() {},
       getExtension(name) {
         if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+        if (name === 'WEBGL_lose_context') return { loseContext(){}, restoreContext(){} };
+        // A real ANGLE context exposes ~39 extensions; returning null for all but
+        // one made obscura's WebGL look like no real GPU (a strong anti-detect
+        // tell). Hand back a non-null stub for every extension the enumeration
+        // (getSupportedExtensions) advertises so getExtension() agrees.
+        if (_WEBGL_EXTENSIONS.indexOf(name) >= 0) return {};
         return null;
       },
       getParameter(pname) {
@@ -6899,8 +6921,8 @@ Element.prototype.getContext = function getContext(type) {
         if (pname === 0x9246) return _fp('gpu');
         if (pname === 0x1F01) return 'WebKit WebGL';  // GL_RENDERER
         if (pname === 0x1F00) return 'WebKit';          // GL_VENDOR
-        if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
-        if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
+        if (pname === 0x1F02) return 'WebGL 1.0 (OpenGL ES 2.0 Chromium)'; // GL_VERSION (WebGL1)
+        if (pname === 0x8B8C) return 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)'; // GL_SHADING_LANGUAGE_VERSION (WebGL1)
         if (pname === undefined) return [0, 0];
         if (pname === 0x0D33) return 16384;     // GL_MAX_TEXTURE_SIZE
         if (pname === 0x0D3A) return new Int32Array([32767, 32767]); // GL_MAX_VIEWPORT_DIMS
@@ -6925,8 +6947,16 @@ Element.prototype.getContext = function getContext(type) {
         if (pname === 0x0D57) return 0;         // STENCIL_BITS
         return 0;
       },
-      getSupportedExtensions() { return ['WEBGL_debug_renderer_info','EXT_texture_filter_anisotropic','WEBGL_compressed_texture_s3tc','WEBGL_lose_context']; },
-      getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
+      getSupportedExtensions() { return _WEBGL_EXTENSIONS.slice(); },
+      getShaderPrecisionFormat(shaderType, precisionType) {
+        // Integer precision types report differently from floats on a real GPU
+        // (e.g. HIGH_INT => {rangeMin:31,rangeMax:30,precision:0}); returning the
+        // float triple for everything is a tell. 0x8DF3/4/5 = LOW/MEDIUM/HIGH_INT.
+        if (precisionType === 0x8DF3 || precisionType === 0x8DF4 || precisionType === 0x8DF5) {
+          return { rangeMin: 31, rangeMax: 30, precision: 0 };
+        }
+        return { rangeMin: 127, rangeMax: 127, precision: 23 };
+      },
       createBuffer() { return {}; }, createShader() { return {}; }, createProgram() { return {}; },
       shaderSource() {}, compileShader() {}, attachShader() {}, linkProgram() {},
       getProgramParameter() { return true; }, useProgram() {}, deleteShader() {},
