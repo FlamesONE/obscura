@@ -24,3 +24,80 @@
     try { Object.defineProperty(globalThis, n, { value: C, writable: true, configurable: true }); } catch (e) { globalThis[n] = C; }
   }
 })();
+
+// Missing lowercase window instance-properties real Chrome exposes. Same
+// rationale as the interface stubs above: enumeration parity + anti-bot code
+// reads several of these (visualViewport, trustedTypes, crossOriginIsolated).
+// Guarded so obscura's own definitions win.
+(function () {
+  const _def = (n, v) => {
+    try { if (typeof globalThis[n] === 'undefined') Object.defineProperty(globalThis, n, { value: v, writable: true, configurable: true, enumerable: true }); } catch (e) {}
+  };
+  const _bar = () => ({ visible: true });
+  _def('crossOriginIsolated', false);
+  _def('isSecureContext', true);
+  _def('originAgentCluster', false);
+  _def('offscreenBuffering', true);
+  _def('closed', false);
+  _def('status', '');
+  _def('name', '');
+  _def('clientInformation', globalThis.navigator);
+  _def('external', { AddSearchProvider() {}, IsSearchProviderInstalled() {} });
+  _def('locationbar', _bar());
+  _def('menubar', _bar());
+  _def('personalbar', _bar());
+  _def('scrollbars', _bar());
+  _def('statusbar', _bar());
+  _def('toolbar', _bar());
+  _def('styleMedia', { type: 'screen', matchMedium() { return false; } });
+  _def('trustedTypes', {
+    createPolicy(name, rules) { return { name, createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s }; },
+    isHTML() { return false; }, isScript() { return false; }, isScriptURL() { return false; },
+    getAttributeType() { return null; }, getPropertyType() { return null; },
+    get defaultPolicy() { return null; }, get emptyHTML() { return ''; }, get emptyScript() { return ''; },
+  });
+  _def('cookieStore', { get() { return Promise.resolve(null); }, getAll() { return Promise.resolve([]); }, set() { return Promise.resolve(); }, delete() { return Promise.resolve(); }, addEventListener() {}, removeEventListener() {} });
+  _def('scheduler', { postTask(cb) { return Promise.resolve().then(() => (typeof cb === 'function' ? cb() : undefined)); }, yield() { return Promise.resolve(); } });
+  try {
+    if (typeof globalThis.visualViewport === 'undefined') {
+      const _vv = {
+        get offsetLeft() { return 0; }, get offsetTop() { return 0; },
+        get pageLeft() { return 0; }, get pageTop() { return 0; },
+        get width() { return globalThis.innerWidth || 1280; }, get height() { return globalThis.innerHeight || 720; },
+        get scale() { return 1; }, get segments() { return null; },
+        onresize: null, onscroll: null,
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+      };
+      Object.defineProperty(globalThis, 'visualViewport', { value: _vv, writable: true, configurable: true, enumerable: true });
+    }
+  } catch (e) {}
+})();
+
+// Missing window METHODS real Chrome exposes as own function-valued properties.
+// Cloudflare's challenge VM binds window methods into its register file; a
+// missing one lands as an undefined (unbindable) slot -> "X is not a function".
+// obscura already has getComputedStyle/matchMedia/open/alert/etc.; these are the
+// remaining standard ones. Native-masked, guarded.
+(function () {
+  const _fn = (n, impl) => {
+    try {
+      if (typeof globalThis[n] === 'function') return;
+      const f = impl || function () {};
+      try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
+      try { if (typeof _markNativeAs === 'function') _markNativeAs(f, 'function ' + n + '() { [native code] }'); } catch (e) {}
+      Object.defineProperty(globalThis, n, { value: f, writable: true, configurable: true, enumerable: true });
+    } catch (e) {}
+  };
+  _fn('find', function find() { return false; });
+  _fn('moveBy', function moveBy() {});
+  _fn('moveTo', function moveTo() {});
+  _fn('resizeBy', function resizeBy() {});
+  _fn('resizeTo', function resizeTo() {});
+  _fn('captureEvents', function captureEvents() {});
+  _fn('releaseEvents', function releaseEvents() {});
+  _fn('queryLocalFonts', function queryLocalFonts() { return Promise.resolve([]); });
+  _fn('getScreenDetails', function getScreenDetails() { return Promise.reject(new (globalThis.DOMException || Error)('Permission denied', 'NotAllowedError')); });
+  _fn('showOpenFilePicker', function showOpenFilePicker() { return Promise.reject(new (globalThis.DOMException || Error)('Must be handling a user gesture to show a file picker.', 'SecurityError')); });
+  _fn('showSaveFilePicker', function showSaveFilePicker() { return Promise.reject(new (globalThis.DOMException || Error)('Must be handling a user gesture to show a file picker.', 'SecurityError')); });
+  _fn('showDirectoryPicker', function showDirectoryPicker() { return Promise.reject(new (globalThis.DOMException || Error)('Must be handling a user gesture to show a file picker.', 'SecurityError')); });
+})();
