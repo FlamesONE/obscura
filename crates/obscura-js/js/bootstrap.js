@@ -6925,7 +6925,11 @@ Element.prototype.getContext = function getContext(type) {
       createTexture() { return {}; }, bindTexture() {}, texImage2D() {}, texParameteri() {},
       activeTexture() {}, pixelStorei() {}, generateMipmap() {},
       createFramebuffer() { return {}; }, bindFramebuffer() {}, framebufferTexture2D() {},
-      readPixels(x,y,w,h,f,t,d) { if(d) for(let i=0;i<d.length;i++) d[i]=Math.floor(Math.random()*256); },
+      // Deterministic per-session, NOT Math.random(): a real GPU rasterizes the
+      // same scene to identical bytes every read, so a fingerprinter reading
+      // twice gets one stable value. Random noise per read is the textbook
+      // anti-detect-browser signature (it perturbs the fingerprint each time).
+      readPixels(x,y,w,h,f,t,d) { if(d) for(let i=0;i<d.length;i++) d[i]=Math.floor(_fpRand(i * 2654435761 >>> 0) * 256); },
       VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30, LINK_STATUS: 0x8B82,
       ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88E4, FLOAT: 0x1406,
       TRIANGLES: 0x0004, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
