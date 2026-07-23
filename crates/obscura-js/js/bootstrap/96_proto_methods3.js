@@ -166,7 +166,7 @@
     _m(P,'toString',function toString(){return undefined;});
   } } catch(e){}
   try { const P=globalThis.FormData&&globalThis.FormData.prototype; if(P){
-    _m(P,'delete',function delete(){return undefined;});
+    _m(P,'delete',function(){return undefined;});
     _m(P,'set',function set(){return undefined;});
     _m(P,'keys',function keys(){return [][Symbol.iterator]();});
     _m(P,'values',function values(){return [][Symbol.iterator]();});
