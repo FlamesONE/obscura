@@ -539,20 +539,65 @@ globalThis.requestAnimationFrame = (fn) => setTimeout(() => fn(globalThis.perfor
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
+// A functional MessagePort pair. The earlier stub only delivered to `.onmessage`
+// and had a no-op `addEventListener`, so any code that awaits a port message via
+// `port.addEventListener('message', h, {once:true})` (the standard idiom, used
+// by e.g. iphey/MixVisit's worker-client handshake and comlink-style RPC) never
+// received it and hung forever. Messages now dispatch to BOTH `onmessage` and
+// every `addEventListener('message')` listener, with `once`/`start`/`close`
+// honored, matching the real MessagePort contract closely enough for RPC.
+function _makeMessagePort() {
+  const listeners = [];
+  let onmessage = null;
+  let peer = null;
+  let started = false;
+  const queue = [];
+  const deliver = (evt) => {
+    if (typeof onmessage === 'function') { try { onmessage(evt); } catch (e) {} }
+    for (const l of listeners.slice()) {
+      try { l.fn.call(port, evt); } catch (e) {}
+      if (l.once) { const i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); }
+    }
+  };
+  const flush = () => { while (started && queue.length) deliver(queue.shift()); };
+  const port = {
+    get onmessage() { return onmessage; },
+    // Assigning onmessage implicitly starts the port (per spec), draining any
+    // messages that arrived before a handler was attached.
+    set onmessage(fn) { onmessage = fn; started = true; Promise.resolve().then(flush); },
+    postMessage(data) {
+      const target = peer;
+      if (!target) return;
+      Promise.resolve().then(() => target._enqueue({ data }));
+    },
+    addEventListener(type, fn, opts) {
+      if (type !== 'message' || typeof fn !== 'function') return;
+      listeners.push({ fn, once: !!(opts && (opts === true ? false : opts.once)) });
+      // A 'message' listener also implicitly starts the port in practice.
+      started = true; Promise.resolve().then(flush);
+    },
+    removeEventListener(type, fn) {
+      const i = listeners.findIndex((l) => l.fn === fn);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    dispatchEvent(evt) { deliver(evt); return true; },
+    start() { started = true; flush(); },
+    close() { started = false; peer = null; },
+    _enqueue(evt) { queue.push(evt); if (started) Promise.resolve().then(flush); },
+    _setPeer(p) { peer = p; },
+  };
+  return port;
+}
 class MessageChannel {
   constructor() {
-    this.port1 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port2 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port1.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port2.onmessage) this.port2.onmessage({ data }); });
-    };
-    this.port2.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port1.onmessage) this.port1.onmessage({ data }); });
-    };
+    this.port1 = _makeMessagePort();
+    this.port2 = _makeMessagePort();
+    this.port1._setPeer(this.port2);
+    this.port2._setPeer(this.port1);
   }
 }
 globalThis.MessageChannel = MessageChannel;
-globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
+globalThis.MessagePort = class MessagePort { constructor(){ return _makeMessagePort(); } };
 
 const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -2016,6 +2061,19 @@ class Element extends Node {
     if (this.localName === 'iframe' && v && v !== 'about:blank') {
       __registerDynamicIframe(this);
       this._loadIframeSrc(v);
+    } else if (this.localName === 'img' && v && !Object.getOwnPropertyDescriptor(this, 'src')) {
+      // No real image decoder: emulate a successful decode so `<img>` elements
+      // created via document.createElement('img') (or parsed markup) fire load —
+      // `new Image()` already does via its own per-instance `src` override, so
+      // the own-descriptor guard above skips those to avoid a double load event.
+      // Fingerprint/analytics code that sets an <img>.src and awaits
+      // load/onload (e.g. iphey/MixVisit) would otherwise hang forever.
+      const el = this;
+      el.complete = false;
+      setTimeout(function () {
+        el.complete = true;
+        try { el.dispatchEvent(new Event('load')); } catch (e) {}
+      }, 0);
     }
   }
   _loadIframeSrc(url) {
@@ -2024,6 +2082,13 @@ class Element extends Node {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     const el = this;
+    // Fire load via dispatchEvent, not a direct el.onload() call: dispatchEvent
+    // invokes BOTH the onload IDL attribute handler AND every
+    // addEventListener('load') listener (the standard idiom, used by e.g. the
+    // Prismic toolbar's iframe-client handshake that iphey embeds). The old
+    // direct-call path only ran the onload property, so code awaiting the iframe
+    // load via addEventListener hung forever.
+    const _fireLoad = () => { try { el.dispatchEvent(new Event('load')); } catch (e) {} };
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
@@ -2033,18 +2098,11 @@ class Element extends Node {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
-
-      if (typeof el.onload === 'function') {
-        try { el.onload(); } catch(e) {}
-      } else {
-        var onloadAttr = el.getAttribute('onload');
-        if (onloadAttr) try { (0, eval)(onloadAttr); } catch(e) {}
-      }
+      _fireLoad();
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-
-      if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
+      _fireLoad();
     });
   }
   get contentDocument() {
@@ -7002,13 +7060,45 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
+globalThis.speechSynthesis = (function () {
+  const _voices = [{ name: 'Google US English', lang: 'en-US', default: true, localService: true, voiceURI: 'Google US English' }];
+  const _ls = {};
+  let _onvoiceschanged = null;
+  const ss = {
+    speaking: false, pending: false, paused: false,
+    getVoices() { return _voices.slice(); },
+    speak() {}, cancel() {}, pause() {}, resume() {},
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      (_ls[type] || (_ls[type] = [])).push(fn);
+      // Real Chrome loads voices asynchronously and fires `voiceschanged` once
+      // they're ready; collectors (e.g. MixVisit) `await` that event before
+      // reading getVoices(). The earlier no-op addEventListener meant the event
+      // never arrived and those collectors hung forever. Voices are already
+      // available here, so fire once right after a listener subscribes.
+      if (type === 'voiceschanged') {
+        setTimeout(() => { try { ss.dispatchEvent(new Event('voiceschanged')); } catch (e) {} }, 0);
+      }
+    },
+    removeEventListener(type, fn) {
+      const a = _ls[type]; if (!a) return;
+      const i = a.indexOf(fn); if (i >= 0) a.splice(i, 1);
+    },
+    dispatchEvent(evt) {
+      (_ls[evt.type] || []).slice().forEach((f) => { try { f.call(ss, evt); } catch (e) {} });
+      if (evt.type === 'voiceschanged' && typeof _onvoiceschanged === 'function') {
+        try { _onvoiceschanged.call(ss, evt); } catch (e) {}
+      }
+      return true;
+    },
+    get onvoiceschanged() { return _onvoiceschanged; },
+    set onvoiceschanged(fn) {
+      _onvoiceschanged = fn;
+      if (typeof fn === 'function') setTimeout(() => { try { ss.dispatchEvent(new Event('voiceschanged')); } catch (e) {} }, 0);
+    },
+  };
+  return ss;
+})();
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -7301,7 +7391,20 @@ globalThis.Worker = class Worker {
     const scope = worker._makeScope();
     worker._scope = scope;
     try {
-      const runWorkerSource = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
+      // Worker scripts very commonly assign a bare `onmessage = fn` (no
+      // `self.`), which in a real worker sets the global-scope handler. Run via
+      // a plain `new Function`, that write would instead leak to the page global
+      // and `scope.onmessage` would stay unset, so the handler never fires and
+      // the worker silently never replies (observed: iphey's console-timing
+      // worker `onmessage = function(e){...postMessage(...)}` — its reply is
+      // awaited by the fingerprint, so the whole verdict hung). Declare the
+      // event-handler names as function-local bindings, then copy any the script
+      // assigned onto the scope after it runs. Works in both sloppy and strict
+      // worker code (unlike `with(self)`, which is a SyntaxError under strict).
+      const HN = ['onmessage', 'onerror', 'onmessageerror'];
+      const prologue = 'var ' + HN.join(',') + ';\n';
+      const epilogue = '\n;' + HN.map(h => 'if(typeof ' + h + '!=="undefined"&&' + h + ')self.' + h + '=' + h + ';').join('');
+      const runWorkerSource = new Function('self', 'postMessage', 'addEventListener', 'close', prologue + worker._code + epilogue);
       runWorkerSource(scope, scope.postMessage, scope.addEventListener, scope.close);
     } catch(e) {
       console.error('Worker error:', e.message);

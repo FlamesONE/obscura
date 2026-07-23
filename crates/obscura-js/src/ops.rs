@@ -651,6 +651,49 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
 
+/// Decode an RFC 2397 `data:` URL into (content-type, bytes). Returns None when
+/// malformed. Handles both base64 (`;base64`) and percent-encoded payloads.
+fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let data = &rest[comma + 1..];
+    let is_base64 = meta.ends_with(";base64");
+    let mime = meta.strip_suffix(";base64").unwrap_or(meta);
+    let content_type = if mime.is_empty() {
+        "text/plain;charset=US-ASCII".to_string()
+    } else {
+        mime.to_string()
+    };
+    let bytes = if is_base64 {
+        // Long payloads may wrap; strip any whitespace before decoding.
+        let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        BASE64.decode(cleaned.as_bytes()).ok()?
+    } else {
+        percent_decode_bytes(data)
+    };
+    Some((content_type, bytes))
+}
+
+/// Minimal percent-decoding for the non-base64 `data:` URL body.
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -663,6 +706,29 @@ async fn op_fetch_url(
     #[string] mode: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
+
+    // data: URLs resolve locally (RFC 2397) — there is no network fetch. Real
+    // browsers let fetch()/XHR read them; without this, `fetch("data:...")`
+    // fell through to the network path and failed with net::ERR_FAILED. That
+    // silently broke any page loading an inline resource this way — notably
+    // iphey's MixVisit fingerprint, which fetches an inline WASM module as a
+    // data: URL; the rejection left its whole verdict unresolved.
+    if url.starts_with("data:") {
+        return Ok(match decode_data_url(&url) {
+            Some((content_type, bytes)) => serde_json::json!({
+                "status": 200,
+                "body": String::from_utf8_lossy(&bytes),
+                "bodyBase64": BASE64.encode(&bytes),
+                "url": url,
+                "headers": { "content-type": content_type },
+            }),
+            None => serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "error": "malformed data: URL",
+            }),
+        }
+        .to_string());
+    }
 
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url) {
@@ -1302,7 +1368,27 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{decode_data_url, glob_match};
+
+    #[test]
+    fn decode_data_url_base64_and_plain() {
+        // base64 payload (the shape iphey's inline WASM uses)
+        let (ct, bytes) = decode_data_url("data:application/wasm;base64,AGFzbQEAAAA=").unwrap();
+        assert_eq!(ct, "application/wasm");
+        assert_eq!(bytes, vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+
+        // plain (percent-encoded) payload
+        let (ct, bytes) = decode_data_url("data:text/plain,Hello%20World").unwrap();
+        assert_eq!(ct, "text/plain");
+        assert_eq!(bytes, b"Hello World");
+
+        // empty mediatype → RFC 2397 default
+        let (ct, _) = decode_data_url("data:,abc").unwrap();
+        assert_eq!(ct, "text/plain;charset=US-ASCII");
+
+        // malformed (no comma)
+        assert!(decode_data_url("data:application/wasm;base64").is_none());
+    }
 
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
