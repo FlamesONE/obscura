@@ -6801,9 +6801,27 @@ Element.prototype.getContext = function getContext(type) {
         if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
         if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
         if (pname === undefined) return [0, 0];
-        if (pname === 0x0D33) return 8192;      // GL_MAX_TEXTURE_SIZE (scalar)
-        if (pname === 0x0D3A) return [8192, 8192]; // GL_MAX_VIEWPORT_DIMS (array)
-        if (pname === 0x8A2A) return [8192, 8192];
+        if (pname === 0x0D33) return 16384;     // GL_MAX_TEXTURE_SIZE
+        if (pname === 0x0D3A) return new Int32Array([32767, 32767]); // GL_MAX_VIEWPORT_DIMS
+        if (pname === 0x851C) return 16384;     // MAX_CUBE_MAP_TEXTURE_SIZE
+        if (pname === 0x84E8) return 16384;     // MAX_RENDERBUFFER_SIZE
+        if (pname === 0x8869) return 16;        // MAX_VERTEX_ATTRIBS
+        if (pname === 0x8DFB) return 4096;      // MAX_VERTEX_UNIFORM_VECTORS
+        if (pname === 0x8DFC) return 30;        // MAX_VARYING_VECTORS
+        if (pname === 0x8B4C) return 16;        // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+        if (pname === 0x8872) return 16;        // MAX_TEXTURE_IMAGE_UNITS
+        if (pname === 0x8B4D) return 32;        // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+        if (pname === 0x8DFD) return 1024;      // MAX_FRAGMENT_UNIFORM_VECTORS
+        if (pname === 0x846E) return new Float32Array([1, 1]);       // ALIASED_LINE_WIDTH_RANGE
+        if (pname === 0x846D) return new Float32Array([1, 1024]);    // ALIASED_POINT_SIZE_RANGE
+        if (pname === 0x84FF) return 16;        // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+        if (pname === 0x0D50) return 4;         // SUBPIXEL_BITS
+        if (pname === 0x0D52) return 8;         // RED_BITS
+        if (pname === 0x0D53) return 8;         // GREEN_BITS
+        if (pname === 0x0D54) return 8;         // BLUE_BITS
+        if (pname === 0x0D55) return 8;         // ALPHA_BITS
+        if (pname === 0x0D56) return 24;        // DEPTH_BITS
+        if (pname === 0x0D57) return 0;         // STENCIL_BITS
         return 0;
       },
       getSupportedExtensions() { return ['WEBGL_debug_renderer_info','EXT_texture_filter_anisotropic','WEBGL_compressed_texture_s3tc','WEBGL_lose_context']; },
