@@ -2291,8 +2291,16 @@ class Element extends Node {
     });
     return this._dataset;
   }
-  get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get offsetWidth() {
+    if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
+    const p = _fontProbeWidth(this);
+    return p ? p.w : 100;
+  }
+  get offsetHeight() {
+    if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    const p = _fontProbeWidth(this);
+    return p ? p.h : 20;
+  }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
   // documentElement / body / window expose VIEWPORT geometry, not their own content box.
   // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
@@ -2338,9 +2346,14 @@ class Element extends Node {
     const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
     const x = 10 + col * GX;
     const y = 10 + row * GY;
+    // Font-probe elements must measure per family here too (Client Rects /
+    // getBoundingClientRect-based font detection), else every font matches.
+    const p = _fontProbeWidth(this);
+    const w = p ? p.w : CW;
+    const h = p ? p.h : CH;
     return {
-      x, y, width: CW, height: CH,
-      top: y, right: x + CW, bottom: y + CH, left: x,
+      x, y, width: w, height: h,
+      top: y, right: x + w, bottom: y + h, left: x,
       toJSON() { return this; },
     };
   }
@@ -6547,6 +6560,71 @@ function _encodePNG(w, h, rgba) {
 
 globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
+
+// Stock Windows 10 font family set (lowercased). A font-detection probe
+// measures a reference string in "'TestFont', <generic>" and compares the
+// width against the plain <generic>: an installed font shifts the metrics, a
+// missing one falls back to the generic and matches. measureText/element
+// widths that ignore the family therefore make EVERY font look absent, so the
+// fingerprint collapses to the hash of an empty set (SHA-256("")) — a blatant
+// anti-detect tell. _fontAdvance gives each installed family a distinct,
+// deterministic per-character advance while generics and unknown families keep
+// the baseline, so a probe recovers a realistic Windows font list.
+const _WIN_FONTS = new Set([
+  'arial','arial black','bahnschrift','calibri','cambria','cambria math','candara',
+  'comic sans ms','consolas','constantia','corbel','courier new','ebrima',
+  'franklin gothic medium','gabriola','gadugi','georgia','impact','ink free',
+  'javanese text','leelawadee ui','lucida console','lucida sans unicode','ms gothic',
+  'mv boli','malgun gothic','marlett','microsoft himalaya','microsoft jhenghei',
+  'microsoft new tai lue','microsoft phagspa','microsoft sans serif','microsoft tai le',
+  'microsoft yahei','microsoft yi baiti','mingliu-extb','mongolian baiti','myanmar text',
+  'nirmala ui','palatino linotype','segoe mdl2 assets','segoe print','segoe script',
+  'segoe ui','segoe ui emoji','segoe ui historic','segoe ui symbol','simsun','sitka',
+  'sylfaen','symbol','tahoma','times new roman','trebuchet ms','verdana','webdings',
+  'wingdings','yu gothic','yu gothic ui','microsoft yahei ui','dubai',
+]);
+function _canvasPrimaryFont(fontStr) {
+  // Grab the first family token from a CSS font shorthand ("italic 72px 'Arial', serif").
+  const s = String(fontStr || '');
+  const m = s.match(/(?:\d[\d.]*(?:px|pt|em|%)\s+)?(.+)$/);
+  let fam = (m ? m[1] : s).split(',')[0].trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+  return fam;
+}
+function _fontAdvance(fontStr) {
+  const fam = _canvasPrimaryFont(fontStr);
+  // Generic families and unknown families measure at the baseline advance, so
+  // an uninstalled probe font falls back to the generic and reads as absent.
+  if (!fam || fam === 'monospace' || fam === 'sans-serif' || fam === 'serif' ||
+      fam === 'cursive' || fam === 'fantasy' || fam === 'system-ui' || !_WIN_FONTS.has(fam)) {
+    return 6.0;
+  }
+  // Deterministic per-font advance in ~[5.5, 6.7], stable across runs.
+  let h = 0;
+  for (let i = 0; i < fam.length; i++) h = (h * 131 + fam.charCodeAt(i)) >>> 0;
+  return 5.5 + (h % 1200) / 1000;
+}
+// Font-detection probes measure a text element after setting an inline
+// font-family, reading offsetWidth / getBoundingClientRect().width. Return a
+// family-dependent width for exactly that pattern (inline font-family + text)
+// so a probe recovers the installed Windows set; null (→ the caller's default)
+// for everything else keeps the blast radius off ordinary layout reads.
+function _fontProbeWidth(el) {
+  try {
+    const st = el.style;
+    if (!st) return null;
+    const gp = st.getPropertyValue ? (p) => st.getPropertyValue(p) : () => '';
+    let fam = gp('font-family') || st.fontFamily || '';
+    const fontSh = gp('font') || st.font || '';
+    if (!fam && fontSh) fam = fontSh;
+    if (!fam) return null;
+    const txt = el.textContent || '';
+    if (!txt) return null;
+    const size = parseInt(gp('font-size') || st.fontSize || fontSh) || 16;
+    const adv = _fontAdvance(size + 'px ' + fam);
+    return { w: Math.round(txt.length * adv * (size / 10)), h: Math.max(1, Math.round(size * 1.15)) };
+  } catch (e) { return null; }
+}
+
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -6662,7 +6740,17 @@ class _Canvas2D {
   measureText(t) {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    const adv = _fontAdvance(this.font);
+    const width = String(t).length * adv * scale;
+    return {
+      width,
+      actualBoundingBoxAscent: 7 * scale,
+      actualBoundingBoxDescent: 2 * scale,
+      actualBoundingBoxLeft: 0,
+      actualBoundingBoxRight: width,
+      fontBoundingBoxAscent: Math.round(fontSize * 0.92),
+      fontBoundingBoxDescent: Math.round(fontSize * 0.21),
+    };
   }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
