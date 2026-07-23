@@ -76,3 +76,26 @@
     _add(ElP, 'hasAttributeNS', function hasAttributeNS(ns, n) { try { return this.hasAttribute(n); } catch (e) { return false; } });
   }
 })();
+
+// Missing navigator instance PROPERTIES (objects, not functions — earlier method
+// diffs missed them) that real Chrome exposes and CF probes: userActivation,
+// bluetooth/usb/hid/serial, presentation, xr, ink, windowControlsOverlay,
+// scheduling. Added to the navigator instance, guarded.
+(function () {
+  try {
+    const N = globalThis.navigator;
+    if (!N) return;
+    const _p = (k, v) => { try { if (typeof N[k] === 'undefined') Object.defineProperty(N, k, { value: v, writable: false, configurable: true, enumerable: true }); } catch (e) {} };
+    const _rejNA = () => Promise.reject(new (globalThis.DOMException || Error)('Not allowed', 'NotAllowedError'));
+    _p('userActivation', { get hasBeenActive() { return true; }, get isActive() { return false; } });
+    _p('bluetooth', { getAvailability() { return Promise.resolve(false); }, getDevices() { return Promise.resolve([]); }, requestDevice() { return _rejNA(); }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('usb', { getDevices() { return Promise.resolve([]); }, requestDevice() { return _rejNA(); }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('hid', { getDevices() { return Promise.resolve([]); }, requestDevice() { return _rejNA(); }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('serial', { getPorts() { return Promise.resolve([]); }, requestPort() { return _rejNA(); }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('presentation', { get defaultRequest() { return null; }, set defaultRequest(v) {}, get receiver() { return null; } });
+    _p('xr', { isSessionSupported() { return Promise.resolve(false); }, requestSession() { return _rejNA(); }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('ink', { requestPresenter() { return Promise.resolve(null); } });
+    _p('windowControlsOverlay', { get visible() { return false; }, getTitlebarAreaRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; }, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } });
+    _p('scheduling', { isInputPending() { return false; } });
+  } catch (e) {}
+})();
