@@ -1399,10 +1399,11 @@ mod tests {
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
-        let rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
+        rt.run_page_init();
         rt
     }
 
@@ -1645,7 +1646,6 @@ mod tests {
     #[test]
     fn append_child_flattens_document_fragment() {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);
-        rt.run_page_init();
         let result = rt
             .evaluate(
                 r#"
@@ -1680,7 +1680,6 @@ mod tests {
     #[test]
     fn insert_before_flattens_document_fragment_in_order() {
         let mut rt = setup_runtime(r#"<main id="host"><article id="last"></article></main>"#);
-        rt.run_page_init();
         let result = rt
             .evaluate(
                 r#"
@@ -1716,7 +1715,6 @@ mod tests {
         let mut rt = setup_runtime(
             r#"<main id="host"><article id="old"></article><article id="tail"></article></main>"#,
         );
-        rt.run_page_init();
         let result = rt
             .evaluate(
                 r#"
@@ -2252,11 +2250,11 @@ mod tests {
         drop(rt2);
 
         if let Some(dom) = dom1 {
-            let rt1b = ObscuraJsRuntime::new();
+            let mut rt1b = ObscuraJsRuntime::new();
             rt1b.set_dom(dom);
             rt1b.set_url("http://example.com");
             rt1b.set_title("Page1");
-            let mut rt1b = rt1b;
+            rt1b.run_page_init();
             let title1b = rt1b.evaluate("document.querySelector('h1').textContent").unwrap();
             assert_eq!(title1b, serde_json::json!("Page1"));
         }
@@ -2386,11 +2384,12 @@ mod tests {
     fn setup_runtime_with_cookies(html: &str) -> (ObscuraJsRuntime, std::sync::Arc<obscura_net::CookieJar>) {
         let dom = obscura_dom::parse_html(html);
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
-        let rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
         rt.set_cookie_jar(jar.clone());
+        rt.run_page_init();
         (rt, jar)
     }
 
