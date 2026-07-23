@@ -7,6 +7,8 @@ pub mod blocklist;
 pub mod tls_profile;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
+#[cfg(feature = "stealth")]
+pub mod ws;
 
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,

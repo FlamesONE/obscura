@@ -8051,6 +8051,20 @@ if (typeof EventSource === 'undefined') {
 }
 
 if (typeof WebSocket === 'undefined') {
+  // A real wss:// socket when the stealth transport ops are compiled in
+  // (op_ws_connect etc., see ops.rs). A page that only fakes `open` and never
+  // delivers server frames hangs any protocol awaiting a server-pushed message
+  // — e.g. iphey/MixVisit's WASM opens wss://api.iphey.com/ws/<token>, sends
+  // nothing, and blocks its whole verdict on the server's reply. Falls back to
+  // the legacy fake-open stub in non-stealth builds where the ops are absent.
+  //
+  // Resolved lazily per-construction, NOT cached at class-definition time:
+  // bootstrap.js runs during V8 snapshot creation (build.rs) before the ops
+  // extension is attached, so a value captured here would be baked in as
+  // absent forever. The live `__obscura_core.ops` gains the ops at runtime.
+  const _wsOpsNow = () =>
+    (__obscura_core && __obscura_core.ops && typeof __obscura_core.ops.op_ws_connect === 'function')
+      ? __obscura_core.ops : null;
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
       // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
@@ -8068,22 +8082,93 @@ if (typeof WebSocket === 'undefined') {
       this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
       _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      this._rid = -1;
+      this._closed = false;
+      this._ops = _wsOpsNow();
+      try { this._origin = new URL(url).origin; } catch (e) { this._origin = ''; }
+      const self = this;
+      if (!this._ops) {
+        Promise.resolve().then(() => {
+          if (self.readyState !== 0) return;
+          self.readyState = 1;
+          self._fire(new Event('open'));
+        });
+        return;
+      }
+      const protoArr = Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []);
+      this._ops.op_ws_connect(url, JSON.stringify(protoArr)).then((res) => {
+        if (self._closed) return;
+        let r; try { r = JSON.parse(res); } catch (e) { r = { error: 'bad response' }; }
+        if (r.error || r.rid === undefined) { self._fail(r.error || 'connect failed'); return; }
+        self._rid = r.rid;
+        if (r.protocol) self.protocol = r.protocol;
+        self.readyState = 1;
+        self._fire(new Event('open'));
+        self._pump();
+      }, (e) => { if (!self._closed) self._fail(String(e)); });
     }
-    send(data) { /* drop; no real socket */ }
+    _fire(ev) {
+      const h = this['on' + ev.type];
+      if (typeof h === 'function') { try { h.call(this, ev); } catch (e) {} }
+      try { this.dispatchEvent(ev); } catch (e) {}
+    }
+    _fail(msg) {
+      if (this._closed) return;
+      this._closed = true; this.readyState = 3;
+      this._fire(new Event('error'));
+      const ev = new Event('close'); ev.code = 1006; ev.reason = ''; ev.wasClean = false;
+      this._fire(ev);
+    }
+    _pump() {
+      const self = this;
+      if (self._rid < 0 || self._closed || !self._ops) return;
+      self._ops.op_ws_recv(self._rid).then((res) => {
+        if (self._closed) return;
+        let r; try { r = JSON.parse(res); } catch (e) { self._fail('bad frame'); return; }
+        if (r.type === 'message') {
+          let data;
+          if (r.binary) {
+            const u8 = _base64ToUint8Array(r.bytesBase64 || '');
+            data = (self.binaryType === 'arraybuffer') ? u8.buffer : new Blob([u8]);
+          } else {
+            data = r.text || '';
+          }
+          self._fire(new MessageEvent('message', { data: data, origin: self._origin }));
+          self._pump();
+        } else if (r.type === 'close') {
+          self._doClose(r.code, r.reason, true);
+        } else {
+          self._fail(r.error || 'ws error');
+        }
+      }, (e) => { if (!self._closed) self._fail(String(e)); });
+    }
+    _doClose(code, reason, wasClean) {
+      if (this._closed) return;
+      this._closed = true; this.readyState = 3;
+      const ev = new Event('close');
+      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = !!wasClean;
+      this._fire(ev);
+    }
+    send(data) {
+      if (this.readyState === 0) {
+        throw new DOMException(
+          "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.",
+          'InvalidStateError'
+        );
+      }
+      if (this._closed || this._rid < 0 || !this._ops) return;
+      if (typeof data === 'string') { this._ops.op_ws_send_text(this._rid, data); return; }
+      let u8;
+      if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else u8 = new Uint8Array(0);
+      this._ops.op_ws_send_binary(this._rid, u8);
+    }
     close(code, reason) {
       if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      this.readyState = 2; // CLOSING
+      if (this._ops && this._rid >= 0) this._ops.op_ws_close(this._rid, code || 1000, reason || '');
+      this._doClose(code || 1000, reason || '', true);
     }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };

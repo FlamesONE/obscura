@@ -286,6 +286,52 @@ impl StealthHttpClient {
         })
     }
 
+    /// Open a real WebSocket over the stealth transport. Inherits this client's
+    /// proxy, TLS emulation (JA3/JA4) and timeout, so the `wss://` handshake
+    /// looks identical on the wire to the page's navigations. Returns a driver
+    /// handle whose channels the WS ops pump; see `crate::ws`.
+    pub async fn ws_connect(
+        &self,
+        url: &str,
+        protocols: Vec<String>,
+    ) -> Result<crate::ws::WsHandle, ObscuraNetError> {
+        if let Ok(u) = Url::parse(url) {
+            if let Some(host) = u.host_str() {
+                if crate::blocklist::is_blocked(host) {
+                    return Err(ObscuraNetError::Network(format!("blocked tracker: {}", host)));
+                }
+            }
+        }
+
+        let mut builder = self.client.websocket(url);
+        if !protocols.is_empty() {
+            builder = builder.protocols(protocols);
+        }
+        if let Ok(u) = Url::parse(url) {
+            let cookie_header = self.cookie_jar.get_cookie_header(&u);
+            if !cookie_header.is_empty() {
+                builder = builder.header("Cookie", cookie_header);
+            }
+        }
+        for (k, v) in self.extra_headers.read().await.iter() {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handshake = builder
+            .send()
+            .await
+            .map_err(|e| ObscuraNetError::Network(format!("ws connect {}: {}", url, e)));
+        self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = handshake?;
+
+        let socket = resp
+            .into_websocket()
+            .await
+            .map_err(|e| ObscuraNetError::Network(format!("ws upgrade {}: {}", url, e)))?;
+        Ok(crate::ws::spawn_ws_driver(socket))
+    }
+
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
     }
