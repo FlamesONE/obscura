@@ -56,16 +56,14 @@ impl NetProvider for ImmediateEmptyNetProvider {
 /// fonts) resolve immediately to empty content via [`ImmediateEmptyNetProvider`]
 /// rather than genuinely fetching — see its docs for why. Fonts still resolve
 /// via the system font fallback (`system-fonts` feature, on by default).
-pub fn render_html_to_png(
-    html: &str,
-    base_url: &str,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, RenderError> {
+/// Parse `html`, set the viewport and run Blitz's real Stylo+Taffy layout,
+/// returning the laid-out document. Shared by [`render_html_to_png`] (which then
+/// paints it) and [`layout_boxes`] (which reads its box tree).
+fn build_laid_out_document(html: &str, base_url: &str, width: u32, height: u32) -> BaseDocument {
     let navigation_provider = Arc::new(DummyNavigationProvider);
     let net_provider = Arc::new(ImmediateEmptyNetProvider);
 
-    let mut document = HtmlDocument::from_html(
+    let document = HtmlDocument::from_html(
         html,
         DocumentConfig {
             base_url: Some(base_url.to_string()),
@@ -75,18 +73,29 @@ pub fn render_html_to_png(
         },
     );
 
+    let mut base_document: BaseDocument = document.into();
+
     let viewport = Viewport::new(width, height, 1.0, ColorScheme::Light);
-    document.as_mut().set_viewport(viewport);
-    document.as_mut().resolve(0.0);
+    base_document.set_viewport(viewport);
+    base_document.resolve(0.0);
 
     // Drain any resources (images/fonts) queued during the initial parse —
     // bounded so a hung fetch can't stall the CDP response forever.
     let deadline = Instant::now() + Duration::from_millis(500);
-    while document.as_ref().has_pending_critical_resources() && Instant::now() < deadline {
-        document.as_mut().resolve(0.0);
+    while base_document.has_pending_critical_resources() && Instant::now() < deadline {
+        base_document.resolve(0.0);
     }
 
-    let mut base_document: BaseDocument = document.into();
+    base_document
+}
+
+pub fn render_html_to_png(
+    html: &str,
+    base_url: &str,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, RenderError> {
+    let mut base_document = build_laid_out_document(html, base_url, width, height);
 
     let mut renderer = VelloCpuImageRenderer::new(width, height);
     let mut buf = Vec::with_capacity((width * height * 4) as usize);
@@ -98,6 +107,52 @@ pub fn render_html_to_png(
     );
 
     encode_png(&buf, width, height)
+}
+
+/// Run Blitz layout on `html` and return the absolute box of every element that
+/// carries a `data-onid="<u32>"` attribute (emitted by
+/// `DomTree::outer_html_tagged`), as `(onid, x, y, width, height)` in CSS
+/// pixels. Absolute position is a DFS from the root element accumulating each
+/// node's Taffy `final_layout.location` (relative to its parent's box) onto the
+/// parent's absolute origin. Elements not laid out (display:none) are simply
+/// absent from the result.
+pub fn layout_boxes(
+    html: &str,
+    base_url: &str,
+    width: u32,
+    height: u32,
+) -> Vec<(u32, f32, f32, f32, f32)> {
+    let doc = build_laid_out_document(html, base_url, width, height);
+    let onid_name = blitz_dom::LocalName::from("data-onid");
+
+    let mut out = Vec::new();
+    // (node_id, parent_abs_x, parent_abs_y)
+    let mut stack = vec![(doc.root_element().id, 0.0f32, 0.0f32)];
+    while let Some((id, px, py)) = stack.pop() {
+        let node = match doc.get_node(id) {
+            Some(n) => n,
+            None => continue,
+        };
+        let abs_x = px + node.final_layout.location.x;
+        let abs_y = py + node.final_layout.location.y;
+
+        if node.is_element() {
+            if let Some(onid) = node.attr(onid_name.clone()).and_then(|v| v.parse::<u32>().ok()) {
+                out.push((
+                    onid,
+                    abs_x,
+                    abs_y,
+                    node.final_layout.size.width,
+                    node.final_layout.size.height,
+                ));
+            }
+        }
+
+        for &child in &node.children {
+            stack.push((child, abs_x, abs_y));
+        }
+    }
+    out
 }
 
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
@@ -123,6 +178,21 @@ mod tests {
         let mut buf = vec![0u8; reader.output_buffer_size().expect("valid PNG size")];
         reader.next_frame(&mut buf).expect("decodable frame");
         buf.chunks_exact(4).any(|px| px[3] != 0)
+    }
+
+    #[test]
+    fn layout_boxes_returns_real_geometry_for_tagged_element() {
+        let html = r#"<html><body style="margin:0"><div data-onid="7" style="position:absolute;left:50px;top:30px;width:100px;height:20px"></div></body></html>"#;
+        let boxes = layout_boxes(html, "https://example.com/", 1280, 720);
+        let (_, x, y, w, h) = boxes
+            .into_iter()
+            .find(|(onid, ..)| *onid == 7)
+            .expect("onid 7 must be laid out");
+        let approx = |a: f32, b: f32| (a - b).abs() < 2.0;
+        assert!(approx(x, 50.0), "x={x}");
+        assert!(approx(y, 30.0), "y={y}");
+        assert!(approx(w, 100.0), "w={w}");
+        assert!(approx(h, 20.0), "h={h}");
     }
 
     #[test]

@@ -4,3 +4,5 @@ node_modules/
 package.json
 package-lock.json
 .code-graph/
+.playwright-mcp/
+/vfs_cf_realchrome.png

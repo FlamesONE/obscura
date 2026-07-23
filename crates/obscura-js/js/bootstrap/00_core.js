@@ -98,6 +98,16 @@ globalThis.__obscura_diagFallback = function(name, vmThis) {
   } catch (e) { try { console.error('DIAG receiver-fallback dump failed:', e.message, e.stack); } catch(e2) {} }
 };
 const _dom = (cmd, a1, a2) => __obscura_core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+// Real Blitz/Taffy computed geometry for a node (by obscura-dom nid) as
+// [x, y, w, h] in CSS px, or null when the node isn't laid out (display:none /
+// detached / no layout). Backs the real getBoundingClientRect / offset* path;
+// callers fall back to the synthetic box on null.
+const _layoutBox = (nid) => {
+  try {
+    const r = __obscura_core.ops.op_layout_box(nid | 0);
+    return (!r || r === "null") ? null : JSON.parse(r);
+  } catch (e) { return null; }
+};
 const _frameHtml = (fid) => __obscura_core.ops.op_frame_html(String(fid ?? ""));
 const _frameMeta = (fid) => __obscura_core.ops.op_frame_meta(String(fid ?? ""));
 

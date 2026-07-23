@@ -2502,6 +2502,7 @@ dependencies = [
  "html5ever 0.29.1",
  "obscura-dom",
  "obscura-net",
+ "obscura-render",
  "pbkdf2",
  "reqwest",
  "serde",

@@ -22,8 +22,14 @@ pub(super) fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: Str
 }
 
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
-    let gs = state.borrow::<SharedState>().clone();
-    let gs = gs.borrow();
+    let gs_rc = state.borrow::<SharedState>().clone();
+    // Any command that changes the tree, an attribute, or text invalidates the
+    // cached Blitz layout so the next getBoundingClientRect recomputes. Err on
+    // the side of invalidating: correctness over cache-hit rate.
+    if is_mutating_cmd(&cmd) {
+        gs_rc.borrow_mut().layout_cache = None;
+    }
+    let gs = gs_rc.borrow();
     let dom = match &gs.dom {
         Some(d) => d,
         None => return "null".to_string(),
@@ -343,6 +349,77 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             cur.index().to_string()
         }
         _ => "null".into(),
+    }
+}
+
+/// Commands handled by `op_dom` that mutate the tree, an attribute, or text —
+/// i.e. anything that could change computed layout. `create_*` allocate detached
+/// nodes that don't affect the laid-out tree until appended, but they're cheap
+/// and rare so we invalidate on them too rather than track attach state.
+fn is_mutating_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "set_attribute"
+            | "append_child"
+            | "remove_child"
+            | "insert_before"
+            | "remove_attribute"
+            | "set_inner_html"
+            | "set_text_content"
+            | "create_document_fragment"
+            | "create_element"
+            | "create_text_node"
+            | "create_comment_node"
+            | "create_processing_instruction"
+            | "create_doctype"
+    )
+}
+
+/// Real computed geometry for a node, from Blitz/Taffy layout. Serializes the
+/// live DOM (nid-tagged), runs one Blitz layout pass, caches every element's box
+/// on `ObscuraState`, and returns `[x,y,w,h]` (CSS px) for `nid` as JSON — or
+/// `"null"` if the node isn't laid out (display:none, detached, no layout). The
+/// synthetic-grid fallback in bootstrap JS handles the null case. Cache is
+/// invalidated by `op_dom` on any mutation.
+#[op2]
+#[string]
+pub(super) fn op_layout_box(state: &OpState, #[smi] nid: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        op_layout_box_inner(state, nid)
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("op_layout_box panicked; returning null");
+        "null".to_string()
+    })
+}
+
+fn op_layout_box_inner(state: &OpState, nid: u32) -> String {
+    let gs_rc = state.borrow::<SharedState>().clone();
+
+    if gs_rc.borrow().layout_cache.is_none() {
+        let (html, url) = {
+            let gs = gs_rc.borrow();
+            let dom = match &gs.dom {
+                Some(d) => d,
+                None => return "null".to_string(),
+            };
+            (dom.outer_html_tagged(dom.document()), gs.url.clone())
+        };
+        // ponytail: fixed 1280x720 viewport for v1 (matches the bootstrap
+        // synthetic-grid assumptions); read the FP screen size here if geometry
+        // ever needs to track a non-default viewport.
+        let boxes = obscura_render::layout_boxes(&html, &url, 1280, 720);
+        let mut map = std::collections::HashMap::with_capacity(boxes.len());
+        for (onid, x, y, w, h) in boxes {
+            map.insert(onid, (x, y, w, h));
+        }
+        gs_rc.borrow_mut().layout_cache = Some(map);
+    }
+
+    let gs = gs_rc.borrow();
+    match gs.layout_cache.as_ref().and_then(|m| m.get(&nid)) {
+        Some((x, y, w, h)) => format!("[{},{},{},{}]", x, y, w, h),
+        None => "null".to_string(),
     }
 }
 

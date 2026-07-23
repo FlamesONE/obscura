@@ -965,13 +965,16 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
-    return Math.round(_elemBox(this).w);
+    const r = _layoutBox(this._nid | 0);
+    return Math.round(r ? r[2] : _elemBox(this).w);
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
-    return Math.round(_elemBox(this).h);
+    const r = _layoutBox(this._nid | 0);
+    return Math.round(r ? r[3] : _elemBox(this).h);
   }
-  get offsetTop() { return 0; } get offsetLeft() { return 0; }
+  get offsetTop() { const r = _layoutBox(this._nid | 0); return r ? Math.round(r[1]) : 0; }
+  get offsetLeft() { const r = _layoutBox(this._nid | 0); return r ? Math.round(r[0]) : 0; }
   // documentElement / body / window expose VIEWPORT geometry, not their own content box.
   // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
   // returning 100x20 there made every element appear off-screen and broke .click().
@@ -1001,6 +1004,18 @@ class Element extends Node {
       return {
         x: 0, y: 0, width: vw, height: vh,
         top: 0, right: vw, bottom: vh, left: 0,
+        toJSON() { return this; },
+      };
+    }
+    // Prefer REAL computed geometry from the Blitz/Taffy layout pass when the
+    // node is laid out. Only falls through to the synthetic grid below for
+    // nodes Blitz didn't lay out (display:none / detached / no box).
+    const _real = _layoutBox(this._nid | 0);
+    if (_real) {
+      const rx = _real[0], ry = _real[1], rw = _real[2], rh = _real[3];
+      return {
+        x: rx, y: ry, width: rw, height: rh,
+        top: ry, right: rx + rw, bottom: ry + rh, left: rx,
         toJSON() { return this; },
       };
     }

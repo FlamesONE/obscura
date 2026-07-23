@@ -86,6 +86,11 @@ pub struct JsNetworkEvent {
 
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    /// Cached real layout geometry keyed by obscura-dom NodeId u32, computed
+    /// lazily by `op_layout_box` (serialize tagged HTML -> Blitz layout) and
+    /// invalidated to `None` on any DOM mutation. Value is (x, y, w, h) in CSS
+    /// pixels. Backs the real getBoundingClientRect / offset* geometry.
+    pub layout_cache: Option<std::collections::HashMap<u32, (f32, f32, f32, f32)>>,
     pub url: String,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
@@ -145,6 +150,7 @@ impl ObscuraState {
     pub fn new() -> Self {
         ObscuraState {
             dom: None,
+            layout_cache: None,
             url: "about:blank".to_string(),
             encoding: "UTF-8".to_string(),
             title: String::new(),
@@ -194,6 +200,7 @@ pub fn build_extension() -> Extension {
     #[allow(unused_mut)]
     let mut ops: Vec<deno_core::OpDecl> = vec![
         op_dom(),
+        op_layout_box(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),

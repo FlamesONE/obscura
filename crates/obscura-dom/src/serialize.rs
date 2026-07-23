@@ -15,13 +15,23 @@ enum SerializeWork {
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf);
+        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf, false);
+        buf
+    }
+
+    /// Like [`outer_html`], but stamps every element start tag with a
+    /// `data-onid="<NodeId>"` attribute carrying the obscura-dom node id. Fed to
+    /// obscura-render so the laid-out Blitz boxes can be mapped back to our node
+    /// ids for the real DOM geometry APIs (getBoundingClientRect etc).
+    pub fn outer_html_tagged(&self, node_id: NodeId) -> String {
+        let mut buf = String::new();
+        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf, true);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_worklist(self.child_work(node_id), &mut buf);
+        self.serialize_worklist(self.child_work(node_id), &mut buf, false);
         buf
     }
 
@@ -34,7 +44,7 @@ impl DomTree {
             .collect()
     }
 
-    fn serialize_worklist(&self, mut stack: Vec<SerializeWork>, buf: &mut String) {
+    fn serialize_worklist(&self, mut stack: Vec<SerializeWork>, buf: &mut String, tag_nids: bool) {
         // Defense in depth, mirroring descendants(): a well-formed subtree emits
         // at most one Node plus one CloseTag per node, so 2*nodes.len() work
         // items bound a valid walk. Exceeding it means the graph is cyclic (the
@@ -90,6 +100,11 @@ impl DomTree {
                             buf.push_str(attr_name);
                             buf.push_str("=\"");
                             escape_attr(&attr.value, buf);
+                            buf.push('"');
+                        }
+                        if tag_nids {
+                            buf.push_str(" data-onid=\"");
+                            buf.push_str(&node_id.raw().to_string());
                             buf.push('"');
                         }
                         buf.push('>');
