@@ -2293,13 +2293,11 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
-    const p = _fontProbeWidth(this);
-    return p ? p.w : 100;
+    return Math.round(_elemBox(this).w);
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
-    const p = _fontProbeWidth(this);
-    return p ? p.h : 20;
+    return Math.round(_elemBox(this).h);
   }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
   // documentElement / body / window expose VIEWPORT geometry, not their own content box.
@@ -2346,11 +2344,11 @@ class Element extends Node {
     const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
     const x = 10 + col * GX;
     const y = 10 + row * GY;
-    // Font-probe elements must measure per family here too (Client Rects /
-    // getBoundingClientRect-based font detection), else every font matches.
-    const p = _fontProbeWidth(this);
-    const w = p ? p.w : CW;
-    const h = p ? p.h : CH;
+    // Font-probe elements measure per family (Fonts detection); everything
+    // else gets a deterministic sub-pixel box (Client Rects / element-geometry
+    // fingerprint) instead of a flat round 100x20. Both via _elemBox.
+    const box = _elemBox(this);
+    const w = box.w, h = box.h;
     return {
       x, y, width: w, height: h,
       top: y, right: x + w, bottom: y + h, left: x,
@@ -6623,6 +6621,21 @@ function _fontProbeWidth(el) {
     const adv = _fontAdvance(size + 'px ' + fam);
     return { w: Math.round(txt.length * adv * (size / 10)), h: Math.max(1, Math.round(size * 1.15)) };
   } catch (e) { return null; }
+}
+// Box size for a non-viewport element. There is no layout engine, so an
+// element with no measurable text gets a deterministic, per-session,
+// SUB-PIXEL box instead of a flat round 100x20 — otherwise every element
+// reads identical and the element-geometry fingerprint (iphey's Client Rects
+// on #dom-element-geometry-hidden) hashes to a fixed round value catalogued as
+// a synthetic/anti-detect signature. Kept below the hit-test grid spacing
+// (GX=110, GY=30 in getBoundingClientRect) so cells stay distinct.
+function _elemBox(el) {
+  const p = _fontProbeWidth(el);
+  if (p) return { w: p.w, h: p.h };
+  const nid = (el._nid | 0);
+  const s = _fpRand((nid * 2654435761) >>> 0);
+  const s2 = _fpRand((nid * 40503 + 7) >>> 0);
+  return { w: 72 + s * 32, h: 17 + s2 * 8 };
 }
 
 class _Canvas2D {
