@@ -125,28 +125,20 @@ class _IframeWindow {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
 
-    // Real cross-origin iframe contentWindow still exposes the standard
-    // Window surface (Worker, WebSocket, customElements, origin, opener,
-    // etc.) even though document/most properties are same-origin-gated.
-    // This stub only had ~25 of those; anything CF's challenge script reads
-    // off the frame's window that isn't set above came back `undefined`
-    // instead of a real reference (observed via a VM register dump: a
-    // slot right next to this object was UNDEF where a real browser would
-    // hold one of these). Mirror whatever's already stubbed on the
-    // top-level globalThis rather than re-declaring each one by hand.
-    const _mirroredGlobals = [
-      'origin', 'customElements', 'indexedDB', 'caches', 'Worker', 'WebSocket',
-      'Notification', 'ResizeObserver', 'MutationObserver', 'IntersectionObserver',
-      'PerformanceObserver', 'MessageChannel', 'MessagePort', 'DOMException',
-      'structuredClone', 'queueMicrotask', 'atob', 'btoa', 'XMLHttpRequest',
-      'Headers', 'Request', 'Response', 'Blob', 'File', 'FileReader', 'FormData',
-      'AbortController', 'AbortSignal', 'requestIdleCallback', 'cancelIdleCallback',
-      'ImageData', 'OffscreenCanvas', 'TextEncoder', 'TextDecoder', 'URL',
-      'URLSearchParams', 'HTMLElement', 'Element', 'Event', 'CustomEvent',
-      'WebGLRenderingContext', 'WebGL2RenderingContext', 'CSSStyleSheet',
-    ];
-    for (const k of _mirroredGlobals) {
-      if (this[k] === undefined && globalThis[k] !== undefined) this[k] = globalThis[k];
+    // A same-origin iframe's contentWindow exposes the SAME global surface as
+    // the top window (every interface constructor, method, and global). CF's
+    // challenge creates a probe iframe and reads pristine natives off its
+    // contentWindow; any global obscura defines on the top globalThis but not
+    // here came back `undefined` and landed as an UNDEF slot in the challenge
+    // VM's register file (crash: "X is not a function"). Mirror the ENTIRE
+    // globalThis surface rather than a hand-picked subset. Skip internal
+    // (`__obscura*` / numeric) names and the origin-specific properties already
+    // set on this instance above (self/window/top/parent/document/location/…).
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+      if (k[0] === '_' && k[1] === '_') continue;
+      if (/^\d+$/.test(k)) continue;
+      if (Object.prototype.hasOwnProperty.call(this, k)) continue;
+      try { const v = globalThis[k]; if (v !== undefined) this[k] = v; } catch (e) {}
     }
     // opener is null (not undefined) unless this window was opened via
     // window.open() from a same-origin script, which never applies here.
