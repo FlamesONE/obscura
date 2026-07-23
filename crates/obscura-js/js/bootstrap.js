@@ -6946,10 +6946,35 @@ Element.prototype.toDataURL = function(type) {
   return _fp('canvasFingerprint');
 };
 Element.prototype.toBlob = function(cb, type, q) { cb(new Blob([''])); };
-Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getComputedTextLength = function() { return 0; };
-Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
-Element.prototype.getSubStringLength = function(ch, len) { return 0; };
+// SVG text geometry. A flat 0 made getComputedTextLength() (iphey's "SVG
+// Computed Style" probe on an <svg><text>) read 0.0000 — no real browser
+// renders text to zero width, so it's an anti-detect tell. Derive a
+// font-aware length from the same advance model as canvas/DOM font metrics so
+// the value is non-zero, stable, and consistent across surfaces.
+function _svgTextMetrics(el) {
+  const txt = el.textContent || '';
+  const st = el.style;
+  const gp = (st && st.getPropertyValue) ? (p) => st.getPropertyValue(p) : () => '';
+  const fam = gp('font-family') || (st && st.fontFamily) || (el.getAttribute && el.getAttribute('font-family')) || 'sans-serif';
+  const size = parseInt(gp('font-size') || (st && st.fontSize) || (el.getAttribute && el.getAttribute('font-size')) || '') || 16;
+  const adv = _fontAdvance(size + 'px ' + fam);
+  return { len: txt.length * adv * (size / 10), size };
+}
+Element.prototype.getBBox = function() {
+  const m = _svgTextMetrics(this);
+  return { x: 0, y: 0, width: m.len, height: m.len ? Math.round(m.size * 1.15) : 0 };
+};
+Element.prototype.getComputedTextLength = function() { return _svgTextMetrics(this).len; };
+Element.prototype.getExtentOfChar = function(ch) {
+  const m = _svgTextMetrics(this);
+  const per = (this.textContent || '').length ? m.len / (this.textContent || '').length : 0;
+  return { x: 0, y: 0, width: per, height: per ? Math.round(m.size * 1.15) : 0 };
+};
+Element.prototype.getSubStringLength = function(ch, len) {
+  const m = _svgTextMetrics(this);
+  const total = (this.textContent || '').length;
+  return total ? m.len * (Math.min(len || 0, total) / total) : 0;
+};
 
 _markNative(Element.prototype.getContext);
 _markNative(Element.prototype.toDataURL);
