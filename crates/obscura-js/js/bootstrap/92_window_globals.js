@@ -101,3 +101,39 @@
   _fn('showSaveFilePicker', function showSaveFilePicker() { return Promise.reject(new (globalThis.DOMException || Error)('Must be handling a user gesture to show a file picker.', 'SecurityError')); });
   _fn('showDirectoryPicker', function showDirectoryPicker() { return Promise.reject(new (globalThis.DOMException || Error)('Must be handling a user gesture to show a file picker.', 'SecurityError')); });
 })();
+
+// webkit-prefixed aliases + a few window-level globals real Chrome still exposes
+// (classic fingerprint probes; CF's VM reads them). Alias to the real impls
+// where they exist; stub the rest. Guarded + native-masked.
+(function () {
+  const _alias = (n, target) => { try { if (typeof globalThis[n] === 'undefined' && typeof target !== 'undefined') Object.defineProperty(globalThis, n, { value: target, writable: true, configurable: true, enumerable: true }); } catch (e) {} };
+  const _stubFn = (n, impl) => { try { if (typeof globalThis[n] !== 'undefined') return; const f = impl || function () {}; try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} try { if (typeof _markNativeAs === 'function') _markNativeAs(f, 'function ' + n + '() { [native code] }'); } catch (e) {} Object.defineProperty(globalThis, n, { value: f, writable: true, configurable: true, enumerable: true }); } catch (e) {} };
+  _alias('webkitURL', globalThis.URL);
+  _alias('webkitRequestAnimationFrame', globalThis.requestAnimationFrame);
+  _alias('webkitCancelAnimationFrame', globalThis.cancelAnimationFrame);
+  _alias('webkitRTCPeerConnection', globalThis.RTCPeerConnection);
+  _alias('webkitMediaStream', globalThis.MediaStream);
+  _alias('webkitSpeechRecognition', globalThis.SpeechRecognition);
+  _alias('webkitSpeechGrammar', globalThis.SpeechGrammar);
+  _alias('webkitSpeechGrammarList', globalThis.SpeechGrammarList);
+  _alias('webkitSpeechRecognitionError', globalThis.SpeechRecognitionErrorEvent);
+  _alias('webkitSpeechRecognitionEvent', globalThis.SpeechRecognitionEvent);
+  _stubFn('webkitRequestFileSystem', function webkitRequestFileSystem() {});
+  _stubFn('webkitResolveLocalFileSystemURL', function webkitResolveLocalFileSystemURL() {});
+  _stubFn('fetchLater', function fetchLater() { return { activated: false }; });
+  // IDBKeyRange with the standard static factory methods.
+  try {
+    if (typeof globalThis.IDBKeyRange === 'undefined' || typeof globalThis.IDBKeyRange.bound !== 'function') {
+      const K = globalThis.IDBKeyRange && typeof globalThis.IDBKeyRange === 'function' ? globalThis.IDBKeyRange : function IDBKeyRange() { throw new TypeError('Illegal constructor'); };
+      const mk = (lower, upper, lo, uo) => ({ lower, upper, lowerOpen: !!lo, upperOpen: !!uo, includes() { return false; } });
+      K.only = function only(v) { return mk(v, v, false, false); };
+      K.lowerBound = function lowerBound(v, open) { return mk(v, undefined, open, true); };
+      K.upperBound = function upperBound(v, open) { return mk(undefined, v, true, open); };
+      K.bound = function bound(l, u, lo, uo) { return mk(l, u, lo, uo); };
+      try { if (typeof _markNativeAs === 'function') _markNativeAs(K, 'function IDBKeyRange() { [native code] }'); } catch (e) {}
+      try { Object.defineProperty(globalThis, 'IDBKeyRange', { value: K, writable: true, configurable: true, enumerable: true }); } catch (e) { globalThis.IDBKeyRange = K; }
+    }
+  } catch (e) {}
+  // EventTarget.prototype.when (very new; Observable-based)
+  try { const E = globalThis.EventTarget && globalThis.EventTarget.prototype; if (E && typeof E.when !== 'function') { const w = function when() { return { [Symbol.asyncIterator]() { return { next() { return Promise.resolve({ done: true, value: undefined }); } }; } }; }; try { if (typeof _markNativeAs === 'function') _markNativeAs(w, 'function when() { [native code] }'); } catch (e) {} Object.defineProperty(E, 'when', { value: w, writable: true, configurable: true, enumerable: true }); } } catch (e) {}
+})();
