@@ -104,7 +104,7 @@ ops: std::borrow::Cow::Owned(vec![
 
 ### 3. Add the JS shim
 
-In `crates/obscura-js/js/bootstrap.js`:
+In the relevant section under `crates/obscura-js/js/bootstrap/` (the bootstrap is split into ordered `NN_name.js` files — e.g. `50_fetch_xhr_url.js`, `85_workers_idb_ws.js` — concatenated in filename order at build time; add code to the file whose concern it fits, or a new numbered file at the right ordinal):
 
 ```js
 globalThis.crypto = globalThis.crypto || {};

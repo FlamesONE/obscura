@@ -62,9 +62,9 @@ One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8
 
 ## JS bridge
 
-`obscura-js/js/bootstrap.js` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc.
+`obscura-js/js/bootstrap/` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc. It is split into ordered `NN_name.js` section files (DOM, navigator/screen, fetch/XHR, canvas/fonts, workers/websocket, WPT shims, …) that `build.rs` concatenates in filename order and executes as one classic script into the V8 snapshot.
 
-`obscura-js/src/ops.rs` registers Rust ops that the bootstrap calls into:
+`obscura-js/src/ops/` registers Rust ops that the bootstrap calls into (`mod.rs` holds `ObscuraState` + `build_extension()`; ops live in concern submodules `dom`, `fetch`, `crypto`, `url`, `ws`):
 
 ```js
 Deno.core.ops.op_dom('insert_before', parentNid, refNid, newNid);
