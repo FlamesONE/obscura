@@ -13,6 +13,25 @@ use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
 
+/// User-Agent advertised by CDP browser-metadata endpoints (/json/version,
+/// Browser.getVersion), kept in lockstep with the page-level navigator UA:
+/// operator config wins, else the stealth default (Windows Chrome). A client
+/// reading CDP metadata then sees the same browser the page presents instead of
+/// a stale Linux string.
+pub(crate) fn advertised_user_agent() -> String {
+    if let Some(ua) = obscura_browser::FingerprintConfig::global().user_agent.clone() {
+        return ua;
+    }
+    #[cfg(feature = "stealth")]
+    {
+        obscura_net::STEALTH_USER_AGENT.to_string()
+    }
+    #[cfg(not(feature = "stealth"))]
+    {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36".to_string()
+    }
+}
+
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
 // is reached we return an explicit error response rather than silently dropping.
@@ -650,7 +669,7 @@ fn handle_http_json_blocking(
         "version" => serde_json::to_string_pretty(&json!({
             "Browser": "Chrome/147.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "User-Agent": advertised_user_agent(),
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
@@ -1269,7 +1288,7 @@ fn fast_path_response(text: &str) -> Option<String> {
                 "protocolVersion": "1.3",
                 "product": "Chrome/147.0.0.0",
                 "revision": "@0000000000000000000000000000000000000000",
-                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+                "userAgent": advertised_user_agent(),
                 "jsVersion": "14.5.0.0",
             }))
         }

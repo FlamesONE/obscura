@@ -6,7 +6,7 @@ pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
             "protocolVersion": "1.3",
             "product": "Chrome/147.0.0.0",
             "revision": "@0000000000000000000000000000000000000000",
-            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "userAgent": crate::server::advertised_user_agent(),
             "jsVersion": "14.5.0.0",
         })),
         "close" => {

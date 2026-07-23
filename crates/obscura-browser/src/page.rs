@@ -533,7 +533,15 @@ impl Page {
         let context_platform = self.context.platform.clone();
         let context_ua_platform = self.context.ua_platform.clone();
         let context_ua_platform_version = self.context.ua_platform_version.clone();
-        let fp_seed = fp_seed_for(&self.context.id);
+        // Operator fingerprint overrides. Precomputed here (before frame_mut
+        // borrows self) so the seed and config are available inside the frame
+        // block without a borrow conflict.
+        let fp = crate::fingerprint::FingerprintConfig::global();
+        let fp_seed = fp.fp_seed.unwrap_or_else(|| fp_seed_for(&self.context.id));
+        let fp_js_cfg = fp.js_cfg_json();
+        let fp_geo = fp.geolocation;
+        let fp_hw = fp.hardware_concurrency;
+        let fp_langs = fp.languages.clone();
         let http_client = self.http_client.clone();
         #[cfg(feature = "stealth")]
         let stealth_enabled = self.stealth_client.is_some();
@@ -565,11 +573,13 @@ impl Page {
         #[cfg(feature = "stealth")]
         if stealth_enabled {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            // Config wins over the Linux STEALTH_* defaults so an operator who
+            // pins a Windows/macOS TLS profile can present a matching JS identity.
+            rt.set_user_agent(fp.user_agent.as_deref().unwrap_or(obscura_net::STEALTH_USER_AGENT));
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                fp.platform.as_deref().unwrap_or(obscura_net::STEALTH_NAVIGATOR_PLATFORM),
+                fp.ua_platform.as_deref().unwrap_or(obscura_net::STEALTH_UA_PLATFORM),
+                fp.ua_platform_version.as_deref().unwrap_or(obscura_net::STEALTH_UA_PLATFORM_VERSION),
             );
         } else {
             if let Some(ua) = user_agent.as_deref() {
@@ -592,7 +602,7 @@ impl Page {
                 &context_ua_platform_version,
             );
         }
-        if let Some((lat, lon)) = env_geolocation() {
+        if let Some((lat, lon)) = env_geolocation().or_else(|| fp_geo.map(|g| (g[0], g[1]))) {
             rt.set_geolocation(lat, lon);
         }
         rt.set_cookie_jar(cookie_jar);
@@ -610,9 +620,16 @@ impl Page {
         if let Some(lang) = &emulation_locale {
             let langs = emulation_languages.clone().unwrap_or_else(|| vec![lang.clone()]);
             rt.set_locale(lang, &langs);
+        } else if let Some(langs) = &fp_langs {
+            if let Some(first) = langs.first() {
+                rt.set_locale(first, langs);
+            }
         }
-        if let Some(hw) = emulation_hardware_concurrency {
+        if let Some(hw) = emulation_hardware_concurrency.or(fp_hw) {
             rt.set_hardware_concurrency(hw);
+        }
+        if let Some(ref json) = fp_js_cfg {
+            rt.set_fingerprint_cfg(json);
         }
         // Session-stable fingerprint seed (F1): same identity → same seed across
         // navigations and realms, so canvas/audio/WebGL/screen never drift.
@@ -761,14 +778,18 @@ impl Page {
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
 
+        let fp = crate::fingerprint::FingerprintConfig::global();
+
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            // Config wins over the Linux STEALTH_* defaults so an operator who
+            // pins a Windows/macOS TLS profile can present a matching JS identity.
+            rt.set_user_agent(fp.user_agent.as_deref().unwrap_or(obscura_net::STEALTH_USER_AGENT));
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                fp.platform.as_deref().unwrap_or(obscura_net::STEALTH_NAVIGATOR_PLATFORM),
+                fp.ua_platform.as_deref().unwrap_or(obscura_net::STEALTH_UA_PLATFORM),
+                fp.ua_platform_version.as_deref().unwrap_or(obscura_net::STEALTH_UA_PLATFORM_VERSION),
             );
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {
@@ -791,7 +812,9 @@ impl Page {
                 &self.context.ua_platform_version,
             );
         }
-        if let Some((lat, lon)) = env_geolocation() {
+        if let Some((lat, lon)) =
+            env_geolocation().or_else(|| fp.geolocation.map(|g| (g[0], g[1])))
+        {
             rt.set_geolocation(lat, lon);
         }
 
@@ -817,16 +840,23 @@ impl Page {
             rt.set_dom(dom);
         }
 
-        // Apply CDP Emulation overrides
+        // Apply CDP Emulation overrides, falling back to the fingerprint config.
         if let Some(lang) = &self.emulation_locale {
             let langs = self.emulation_languages.clone().unwrap_or_else(|| vec![lang.clone()]);
             rt.set_locale(lang, &langs);
+        } else if let Some(langs) = &fp.languages {
+            if let Some(first) = langs.first() {
+                rt.set_locale(first, langs);
+            }
         }
-        if let Some(hw) = self.emulation_hardware_concurrency {
+        if let Some(hw) = self.emulation_hardware_concurrency.or(fp.hardware_concurrency) {
             rt.set_hardware_concurrency(hw);
         }
+        if let Some(json) = fp.js_cfg_json() {
+            rt.set_fingerprint_cfg(&json);
+        }
 
-        rt.set_fp_seed(fp_seed_for(&self.context.id));
+        rt.set_fp_seed(fp.fp_seed.unwrap_or_else(|| fp_seed_for(&self.context.id)));
         rt.run_page_init();
         self.js = Some(rt);
         self.sync_frame_snapshots_to_root_runtime();

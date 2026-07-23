@@ -106,11 +106,22 @@ impl BrowserContext {
         if stealth {
             client.block_trackers = true;
         }
+        // Identity precedence: explicit --user-agent > fingerprint config >
+        // rotating profile pool. The config lets an operator pin an exact,
+        // coherent identity instead of the seed-picked default; cookies from it
+        // are preseeded so the first navigation already looks like a warm session.
+        let fp = crate::fingerprint::FingerprintConfig::global();
+        fp.preseed_cookies(&cookie_jar);
         let profile = crate::profiles::select_profile();
-        let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
-        let platform = profile.platform.to_string();
-        let ua_platform = profile.ua_platform.to_string();
-        let ua_platform_version = profile.ua_platform_version.to_string();
+        let resolved_ua = user_agent
+            .or_else(|| fp.user_agent.clone())
+            .unwrap_or_else(|| profile.user_agent.to_string());
+        let platform = fp.platform.clone().unwrap_or_else(|| profile.platform.to_string());
+        let ua_platform = fp.ua_platform.clone().unwrap_or_else(|| profile.ua_platform.to_string());
+        let ua_platform_version = fp
+            .ua_platform_version
+            .clone()
+            .unwrap_or_else(|| profile.ua_platform_version.to_string());
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.

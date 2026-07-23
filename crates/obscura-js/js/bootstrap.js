@@ -31,7 +31,7 @@ let __obscura_core = (typeof Deno !== "undefined" && Deno.core) ? Deno.core : nu
     '__obscura_turnstile_hook_installed', '__obscura_turnstile_token',
     '__capturedSitekey', '__capturedAction', '__capturedCdata',
     '__capturedChlPageData', '__capturedTurnstileCallback',
-    '__obscura_hw', '__obscura_mem',
+    '__obscura_hw', '__obscura_mem', '__obscura_fp_cfg',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
@@ -394,8 +394,13 @@ function _getFp() {
   let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
   for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
   cfp += '==';
+  // Operator-supplied overrides (set at init via __obscura_fp_cfg) win over the
+  // seed-derived pool pick, so a chosen identity can be pinned exactly. Any
+  // field left unset keeps the deterministic pool value.
+  const _cfg = globalThis.__obscura_fp_cfg || {};
   _fpCache = {
-    gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
+    gpu: _cfg.webgl_renderer || gpuPool[idx],
+    gpuVendor: _cfg.webgl_vendor || gpuVendorPool[idx],
     audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
     audioSampleRate: [44100, 48000][Math.floor(_fpRand(101) * 2)],
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
@@ -403,7 +408,9 @@ function _getFp() {
     compRatio: 12 + (_fpRand(104) - 0.5) * 4,
     batteryLevel: 0.5 + _fpRand(200) * 0.5,
     batteryCharging: _fpRand(201) > 0.3,
-    screen: screenPool[Math.floor(_fpRand(300) * screenPool.length)],
+    screen: (Array.isArray(_cfg.screen) && _cfg.screen.length === 2)
+      ? [_cfg.screen[0], _cfg.screen[1]]
+      : screenPool[Math.floor(_fpRand(300) * screenPool.length)],
     canvasFingerprint: cfp,
   };
   return _fpCache;
@@ -3497,7 +3504,8 @@ globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 class Screen {
   constructor(w, h) {
     this._w = w; this._h = h;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
+    var _cd = (globalThis.__obscura_fp_cfg && globalThis.__obscura_fp_cfg.color_depth) || 24;
+    this.colorDepth = _cd; this.pixelDepth = _cd; this.availTop = 0; this.availLeft = 0;
     this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
   }
   get width() { return this._w; }
@@ -8353,10 +8361,11 @@ globalThis.__obscura_init = function() {
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
 
+  var _fpc = globalThis.__obscura_fp_cfg || {};
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+  globalThis.__obscura_hw = _fpc.hardware_concurrency || hwValues[Math.floor(_fpRand(400) * hwValues.length)];
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  globalThis.__obscura_mem = _fpc.device_memory || memValues[Math.floor(_fpRand(401) * memValues.length)];
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;

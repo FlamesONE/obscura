@@ -369,6 +369,19 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Inject the operator-supplied fingerprint overrides as
+    /// `globalThis.__obscura_fp_cfg`. The bootstrap reads it at each pool site
+    /// (screen, WebGL vendor/renderer, device memory, hardware concurrency,
+    /// color depth), preferring a configured value over the seed-derived
+    /// default. `json` is a trusted object literal built by FingerprintConfig;
+    /// must run before __obscura_init. No-op when nothing is configured.
+    pub fn set_fingerprint_cfg(&mut self, json: &str) {
+        let _ = self.runtime.execute_script(
+            "<set-fp-cfg>",
+            format!("globalThis.__obscura_fp_cfg = {};", json),
+        );
+    }
+
     /// Override the coordinates the navigator.geolocation shim reports. The
     /// values are injected as numeric globals the bootstrap reads; when unset it
     /// keeps the built-in default. Callers validate the range before calling.

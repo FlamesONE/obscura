@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util"]
+stealth = ["wreq", "wreq-util", "wreq-util/emulation-serde"]
 
 [dependencies]
 reqwest = { workspace = true }

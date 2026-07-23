@@ -17,24 +17,24 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{Response, ObscuraNetError};
 
-// wreq_util 3.0.0-rc.12's Chrome147 profile ignores `.platform(...)` entirely
-// (verified: Windows and MacOS both still produce the Linux-captured header
-// set — an upstream bug in this pre-release crate, not something fixable
-// from our call site: default_headers() and even a per-request .header()
-// override both get clobbered by wreq's own emulation layer before send).
-// Given the wire-level User-Agent/sec-ch-ua-platform are stuck as Linux, the
-// JS-visible identity below is set to match instead of fighting it — a site
-// comparing wire headers against JS-reported navigator would otherwise see
-// two different operating systems for one "browser".
+// Default stealth JS identity, matched to the default TLS profile's wire
+// headers. As of wreq_util 3.0.0-rc.12 the Chrome147 profile with
+// `.platform(Windows)` DOES emit a fully Windows wire identity — verified
+// against tls.peet.ws: `user-agent: ...Windows NT 10.0...Chrome/147`,
+// `sec-ch-ua-platform: "Windows"`, brands v147. (An earlier rc pinned the wire
+// to Linux regardless of `.platform`; that is no longer the case.) The
+// JS-visible navigator below is set to Windows to agree with that wire so a
+// detector comparing the two sees one coherent OS. An operator who overrides
+// `tls.profile`/`user_agent` via OBSCURA_FP replaces both surfaces together.
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 #[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Linux x86_64";
+pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Linux";
+pub const STEALTH_UA_PLATFORM: &str = "Windows";
 #[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "";
+pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
@@ -51,13 +51,18 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        // JA3/JA4 (TLS + HTTP2 + header presets) come from this emulation
+        // profile. Default is Chrome147/Windows; an operator can pin any wreq
+        // profile via OBSCURA_FP's `tls` key (see tls_profile.rs). When they do,
+        // they are expected to also set a matching user_agent/platform in the
+        // config so wire and JS identities agree.
         // .platform() is currently a no-op for Chrome147 in wreq_util
-        // 3.0.0-rc.12 (see STEALTH_USER_AGENT's doc comment) — kept as
-        // Windows so this starts working for free once upstream fixes it,
-        // rather than left on the Linux value that happens to match today.
+        // 3.0.0-rc.12 (see STEALTH_USER_AGENT's doc comment); it is honored by
+        // other profiles, so the override is still meaningful there.
+        let tls_cfg = crate::tls_profile::TlsConfig::from_env();
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome147)
-            .platform(wreq_util::Platform::Windows)
+            .profile(tls_cfg.resolve_profile().unwrap_or(wreq_util::Profile::Chrome147))
+            .platform(tls_cfg.resolve_platform().unwrap_or(wreq_util::Platform::Windows))
             .build();
 
         // This one timeout bounds both the main-document fetch (`fetch()`,

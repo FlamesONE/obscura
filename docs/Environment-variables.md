@@ -50,6 +50,20 @@ OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
 
 These tune the browser identity the engine presents so it stays internally consistent. See [Configure stealth and proxies](Configure-stealth-and-proxies.md) for the full picture.
 
+### `OBSCURA_FP`
+
+Declare the whole browser fingerprint at init from one JSON source — inline JSON or a path (optionally `@`-prefixed). Every field is optional; any left unset keeps the per-session seed-derived default. Equivalent to the `--fingerprint` CLI flag, and inherited by every subcommand and spawned worker.
+
+Fields: `user_agent`, `platform` (`navigator.platform`), `ua_platform`/`ua_platform_version` (UA-CH), `languages`, `timezone`, `hardware_concurrency`, `device_memory`, `screen` (`[w,h]`), `color_depth`, `webgl_vendor`, `webgl_renderer`, `geolocation` (`[lat,lon]`), `fp_seed`, `cookies` (`[{name,value,domain,path?,secure?,http_only?,same_site?,expires?}]`, preseeded before the first navigation for a warmed session), and `tls` (`{profile,platform}` — the wreq impersonation profile driving JA3/JA4, e.g. `chrome_147`, `firefox_143`, `safari_18`; platform `windows`/`macos`/`linux`/`android`/`ios`).
+
+Keep the identity coherent: when you override `tls.profile` to a non-default browser, also set a matching `user_agent`/`platform`/`ua_platform` so the wire ClientHello and the JS-visible `navigator` agree.
+
+```bash
+obscura serve --stealth --fingerprint @identity.json
+# or inline:
+OBSCURA_FP='{"screen":[2560,1440],"tls":{"profile":"chrome_131","platform":"windows"}}' obscura serve --stealth
+```
+
 ### `OBSCURA_TIMEZONE`
 
 Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report one consistent zone. Default `Europe/Berlin`. Set it to match the exit IP's region.

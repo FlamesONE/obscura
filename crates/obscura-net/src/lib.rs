@@ -4,6 +4,7 @@ pub mod encoding;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
+pub mod tls_profile;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
@@ -19,6 +20,7 @@ pub use encoding::{
 };
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
+pub use tls_profile::TlsConfig;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,

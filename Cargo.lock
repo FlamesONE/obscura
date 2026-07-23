@@ -2419,6 +2419,7 @@ dependencies = [
  "obscura-dom",
  "obscura-js",
  "obscura-net",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -5358,6 +5359,7 @@ checksum = "baa5d2ab72139256916ca352a3d05c53d74e1dd360052eb5ba7691033c417c65"
 dependencies = [
  "brotli",
  "flate2",
+ "serde",
  "typed-builder",
  "wreq",
  "zstd",

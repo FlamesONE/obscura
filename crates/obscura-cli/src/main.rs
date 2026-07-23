@@ -54,6 +54,15 @@ struct Args {
     /// Applied once at startup before any isolate is created.
     #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
     v8_flags: Option<String>,
+
+    /// Fingerprint config: inline JSON or a path to a JSON file (optionally
+    /// `@`-prefixed). Declares the browser identity to present — user_agent,
+    /// platform, screen, color_depth, webgl_vendor/renderer, hardware_concurrency,
+    /// device_memory, languages, timezone, geolocation, cookies, and the TLS
+    /// JA3/JA4 profile (`tls`). Any field left unset keeps the per-seed default.
+    /// Sets OBSCURA_FP for every subcommand and spawned worker. Global.
+    #[arg(long, global = true, value_name = "JSON|PATH")]
+    fingerprint: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -292,6 +301,17 @@ fn effective_v8_flags(user: Option<&str>) -> String {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Mirror --fingerprint into OBSCURA_FP so every subcommand and spawned
+    // worker (which inherit this process's env) read one config source. Must run
+    // before the first FingerprintConfig::global() call below (it caches once).
+    // An explicit OBSCURA_FP in the environment wins.
+    // SAFETY: single-threaded here, before any isolate/worker starts.
+    if let Some(ref fp) = args.fingerprint {
+        if std::env::var_os("OBSCURA_FP").is_none() {
+            unsafe { std::env::set_var("OBSCURA_FP", fp); }
+        }
+    }
+
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
     // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
     // unset it defaults to UTC for Date while the page layer advertised a different
@@ -301,6 +321,14 @@ async fn main() -> anyhow::Result<()> {
     // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
     // effectively single threaded here.
     if let Some(tz) = std::env::var("OBSCURA_TIMEZONE").ok().filter(|s| !s.trim().is_empty()) {
+        unsafe { std::env::set_var("TZ", tz); }
+    } else if let Some(tz) = obscura_browser::FingerprintConfig::global()
+        .timezone
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    {
+        // An explicit fingerprint-config timezone is an operator choice, so it
+        // wins over the host TZ (keeps Date and Intl agreeing with the identity).
         unsafe { std::env::set_var("TZ", tz); }
     } else if std::env::var_os("TZ").is_none() {
         unsafe { std::env::set_var("TZ", "Europe/Berlin"); }
